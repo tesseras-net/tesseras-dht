@@ -1,0 +1,58 @@
+[package]
+name = "tesseras-dht"
+version = "0.1.0"
+edition = "2024"
+description = "Kademlia DHT with integrated chunk storage for the Tesseras P2P network"
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core", "std"] }
+gethostname = "1"
+hex = { version = "0.4", default-features = false, features = ["std"] }
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
+mdns-sd = { version = "0.11", default-features = false, features = ["async"] }
+metrics = "0.24"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = "0.9"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+reed-solomon-erasure = { version = "6", default-features = false, features = ["std"] }
+rmp-serde = "1"
+rusqlite = "0.32"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+socket2 = { version = "0.5", features = ["all"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "test-util"] }
+
+[dependencies.tracing-subscriber]
+version = "0.3"
+optional = true
+
+[dependencies.tempfile]
+version = "3"
+optional = true
+
+[dependencies.metrics-exporter-prometheus]
+version = "0.18"
+optional = true
+
+[[bin]]
+name = "tessera-node"
+required-features = ["cli"]
+
+[[bin]]
+name = "nat-test-helper"
+required-features = ["cli"]
+
+[features]
+# Enables the tessera-node CLI binary (adds tracing-subscriber and tempfile).
+# Build with: cargo build --features cli
+cli = ["clap", "tracing-subscriber", "tempfile", "tokio/signal", "tokio/fs", "tokio/io-std"]
+prometheus = ["metrics-exporter-prometheus"]

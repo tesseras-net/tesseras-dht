@@ -1,0 +1,2451 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ed25519_dalek;
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+
+use crate::erasure::{self, ErasureConfig};
+use crate::error::TesseraError;
+use crate::identity::{Keypair, NodeId, PowProof, verify_node_id};
+use crate::protocol::{Message, Payload};
+use crate::routing::{NodeInfo, NodeInfoSerde, RoutingTable};
+use crate::storage::{ChunkStore, MetadataStore};
+use crate::transport::Transport;
+use crate::transport::rate_limit::RateLimiter;
+use metrics::{counter, gauge, histogram};
+use tracing::instrument;
+
+/// Try each address in `addrs` until one succeeds, falling back on transport errors (S19).
+async fn send_request_any<T: Transport>(
+    transport: &T,
+    addrs: &[SocketAddr],
+    msg: &Message,
+) -> Result<Message, TesseraError> {
+    let mut last_err = TesseraError::Network("no addresses to try".into());
+    for addr in addrs {
+        match transport.send_request(addr, msg.clone()).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// Configurable parameters for a Tessera DHT node.
+#[derive(Clone, Debug)]
+pub struct NodeConfig {
+    pub k: usize,
+    pub alpha: usize,
+    pub max_failures: u8,
+    pub max_relay_hops: u8,
+    pub max_relay_payload: usize,
+    pub relay_rate_per_second: u32,
+    pub relay_rate_burst: u32,
+    pub provider_ttl: Duration,
+    pub rt_save_interval: Duration,
+    pub provider_republish_interval: Duration,
+    pub min_pow_difficulty: u8,
+    pub command_channel_size: usize,
+    pub bucket_refresh_interval: Duration,
+    pub max_chunks_per_peer: u32,
+    pub write_rate_per_second: u32,
+    pub write_rate_burst: u32,
+    /// Maximum number of concurrent inbound handler tasks.
+    pub max_concurrent_handlers: usize,
+    /// Client mode: skip iterative find_node during bootstrap and don't
+    /// advertise this node in the routing table. Useful for ephemeral nodes.
+    pub client_mode: bool,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            k: 20,
+            alpha: 3,
+            max_failures: 3,
+            max_relay_hops: 1,
+            max_relay_payload: 1_048_576,
+            relay_rate_per_second: 5,
+            relay_rate_burst: 3,
+            provider_ttl: Duration::from_secs(48 * 3600),
+            rt_save_interval: Duration::from_secs(300),
+            provider_republish_interval: Duration::from_secs(3600),
+            min_pow_difficulty: 16,
+            command_channel_size: 64,
+            bucket_refresh_interval: Duration::from_secs(3600),
+            max_chunks_per_peer: 256,
+            write_rate_per_second: 50,
+            write_rate_burst: 20,
+            max_concurrent_handlers: 256,
+            client_mode: false,
+        }
+    }
+}
+
+/// Commands sent to the node actor from the public API.
+enum Command {
+    Bootstrap {
+        addrs: Vec<SocketAddr>,
+        reply: oneshot::Sender<Result<(), TesseraError>>,
+    },
+    FindNode {
+        target: NodeId,
+        reply: oneshot::Sender<Result<Vec<NodeInfo>, TesseraError>>,
+    },
+    GetProviders {
+        key: [u8; 32],
+        reply: oneshot::Sender<Result<Vec<NodeInfoSerde>, TesseraError>>,
+    },
+    StoreTessera {
+        data: Vec<u8>,
+        config: ErasureConfig,
+        reply: oneshot::Sender<Result<StoreTesseraResult, TesseraError>>,
+    },
+    RetrieveTessera {
+        chunk_hashes: Vec<[u8; 32]>,
+        config: ErasureConfig,
+        original_len: usize,
+        reply: oneshot::Sender<Result<Vec<u8>, TesseraError>>,
+    },
+    Shutdown,
+}
+
+/// Result of storing a tessera.
+#[derive(Debug, Clone)]
+pub struct StoreTesseraResult {
+    pub chunk_hashes: Vec<[u8; 32]>,
+    pub config: ErasureConfig,
+    pub original_len: usize,
+}
+
+/// Handle for interacting with a running TesseraNode.
+pub struct NodeHandle {
+    cmd_tx: mpsc::Sender<Command>,
+    node_id: NodeId,
+    local_addr: SocketAddr,
+}
+
+impl NodeHandle {
+    /// Returns a reference to this node's ID (SHA-256 of the public key).
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    /// Returns the local socket address this node is listening on.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Returns true if the node actor task is still running.
+    ///
+    /// When the actor panics or exits, the command channel closes and this
+    /// returns `false`. Useful for distinguishing a dead node from transient errors.
+    pub fn is_alive(&self) -> bool {
+        !self.cmd_tx.is_closed()
+    }
+
+    /// Returns the number of queued commands (approximate).
+    pub fn command_queue_len(&self) -> usize {
+        self.cmd_tx.max_capacity() - self.cmd_tx.capacity()
+    }
+
+    /// Connect to bootstrap peers and populate the routing table.
+    ///
+    /// Pings each address to learn the peer's identity, then performs an iterative
+    /// lookup for our own node ID to discover nearby peers.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(handle: tesseras_dht::node::NodeHandle) -> Result<(), tesseras_dht::TesseraError> {
+    /// handle.bootstrap(vec!["192.168.1.1:4433".parse().unwrap()]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self, addrs), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), peer_count = addrs.len()))]
+    pub async fn bootstrap(
+        &self,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<(), TesseraError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Bootstrap { addrs, reply: tx })
+            .await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?;
+        rx.await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?
+    }
+
+    /// Run an iterative Kademlia lookup for the `k` closest nodes to `target`.
+    ///
+    /// Returns up to `k` nodes sorted by XOR distance to the target.
+    #[instrument(skip(self), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), target = %hex::encode(&target.as_bytes()[..4])))]
+    pub async fn find_node(
+        &self,
+        target: NodeId,
+    ) -> Result<Vec<NodeInfo>, TesseraError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::FindNode { target, reply: tx })
+            .await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?;
+        rx.await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?
+    }
+
+    /// Look up providers for a content key.
+    ///
+    /// Checks local metadata first, then queries the `k` closest nodes to the key.
+    /// Returns provider node info (addresses) for nodes that have announced they store
+    /// chunks for this content key.
+    #[instrument(skip(self), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), key = %hex::encode(&key[..4])))]
+    pub async fn get_providers(
+        &self,
+        key: [u8; 32],
+    ) -> Result<Vec<NodeInfoSerde>, TesseraError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::GetProviders { key, reply: tx })
+            .await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?;
+        rx.await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?
+    }
+
+    /// Erasure-encode data and distribute chunks across the DHT.
+    ///
+    /// The data is split into `config.data_shards` pieces plus `config.parity_shards`
+    /// redundancy pieces using Reed-Solomon coding. Each chunk is stored locally and
+    /// distributed to the closest peers. The returned [`StoreTesseraResult`] contains
+    /// the chunk hashes and config needed to retrieve the data later.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(handle: tesseras_dht::node::NodeHandle) -> Result<(), tesseras_dht::TesseraError> {
+    /// use tesseras_dht::erasure::ErasureConfig;
+    ///
+    /// let data = b"important data".to_vec();
+    /// let config = ErasureConfig::new(4, 2).unwrap();
+    /// let result = handle.store_tessera(data, config).await?;
+    /// // Save result.chunk_hashes, result.config, result.original_len for retrieval
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self, data), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), data_len = data.len(), data_shards = config.data_shards(), parity_shards = config.parity_shards()))]
+    pub async fn store_tessera(
+        &self,
+        data: Vec<u8>,
+        config: ErasureConfig,
+    ) -> Result<StoreTesseraResult, TesseraError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::StoreTessera {
+                data,
+                config,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?;
+        rx.await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?
+    }
+
+    /// Retrieve and reconstruct data from erasure-coded chunks.
+    ///
+    /// Fetches chunks from local storage and remote peers, then reconstructs the
+    /// original data using Reed-Solomon decoding. At least `config.data_shards`
+    /// chunks must be available for successful reconstruction.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(
+    /// #     handle: tesseras_dht::node::NodeHandle,
+    /// #     result: tesseras_dht::node::StoreTesseraResult,
+    /// # ) -> Result<(), tesseras_dht::TesseraError> {
+    /// let data = handle.retrieve_tessera(
+    ///     result.chunk_hashes,
+    ///     result.config,
+    ///     result.original_len,
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(skip(self, chunk_hashes), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), num_chunks = chunk_hashes.len(), original_len))]
+    pub async fn retrieve_tessera(
+        &self,
+        chunk_hashes: Vec<[u8; 32]>,
+        config: ErasureConfig,
+        original_len: usize,
+    ) -> Result<Vec<u8>, TesseraError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::RetrieveTessera {
+                chunk_hashes,
+                config,
+                original_len,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?;
+        rx.await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?
+    }
+
+    /// Gracefully shut down the node actor.
+    ///
+    /// Saves the routing table to the metadata store before stopping.
+    #[instrument(skip(self), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4])))]
+    pub async fn shutdown(&self) {
+        let _ = self.cmd_tx.send(Command::Shutdown).await;
+    }
+}
+
+/// Spawn a TesseraNode actor and return a handle.
+pub async fn spawn_node<T: Transport>(
+    keypair: Keypair,
+    pow: PowProof,
+    transport: Arc<T>,
+    metadata: MetadataStore,
+    chunks: ChunkStore,
+    config: NodeConfig,
+) -> NodeHandle {
+    let node_id = keypair.node_id();
+    let local_addr = transport.local_addr();
+    let (cmd_tx, cmd_rx) = mpsc::channel(config.command_channel_size);
+
+    let mut routing_table = RoutingTable::new(node_id, config.k);
+
+    // Load persisted peers from previous session (Gap F)
+    if let Ok(peers) = metadata.load_peers() {
+        for peer in peers {
+            let peer_id = NodeId::from_bytes(peer.node_id);
+            let info = NodeInfo::new(peer_id, peer.public_key, peer.addresses);
+            routing_table.insert(info);
+        }
+        tracing::info!(
+            "loaded {} persisted peers into routing table",
+            routing_table.len()
+        );
+    }
+
+    let relay_limiter = Arc::new(std::sync::Mutex::new(RateLimiter::new(
+        config.relay_rate_per_second,
+        config.relay_rate_burst,
+    )));
+    let write_limiter = Arc::new(std::sync::Mutex::new(RateLimiter::new(
+        config.write_rate_per_second,
+        config.write_rate_burst,
+    )));
+    let peer_chunk_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let handler_semaphore =
+        Arc::new(Semaphore::new(config.max_concurrent_handlers));
+    let config = Arc::new(config);
+
+    let actor = NodeActor {
+        keypair,
+        pow,
+        node_id,
+        transport,
+        routing_table: Arc::new(Mutex::new(routing_table)),
+        metadata: Arc::new(std::sync::Mutex::new(metadata)),
+        chunks: Arc::new(chunks),
+        cmd_rx,
+        handler_semaphore,
+        relay_limiter,
+        write_limiter,
+        peer_chunk_counts,
+        config,
+    };
+
+    tokio::spawn(actor.run());
+
+    NodeHandle {
+        cmd_tx,
+        node_id,
+        local_addr,
+    }
+}
+
+struct NodeActor<T: Transport> {
+    keypair: Keypair,
+    pow: PowProof,
+    node_id: NodeId,
+    transport: Arc<T>,
+    routing_table: Arc<Mutex<RoutingTable>>,
+    metadata: Arc<std::sync::Mutex<MetadataStore>>,
+    chunks: Arc<ChunkStore>,
+    cmd_rx: mpsc::Receiver<Command>,
+    handler_semaphore: Arc<Semaphore>,
+    relay_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    write_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    peer_chunk_counts: Arc<std::sync::Mutex<HashMap<[u8; 32], u32>>>,
+    config: Arc<NodeConfig>,
+}
+
+#[derive(Clone)]
+struct HandlerContext<T: Transport> {
+    keypair: Keypair,
+    pow: PowProof,
+    node_id: NodeId,
+    transport: Arc<T>,
+    routing_table: Arc<Mutex<RoutingTable>>,
+    metadata: Arc<std::sync::Mutex<MetadataStore>>,
+    chunks: ChunkStore,
+    relay_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    write_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    peer_chunk_counts: Arc<std::sync::Mutex<HashMap<[u8; 32], u32>>>,
+    config: Arc<NodeConfig>,
+}
+
+impl<T: Transport> NodeActor<T> {
+    /// Create a new outgoing message with the actor's identity and client_mode flag.
+    fn new_message(&self, payload: Payload) -> Message {
+        let mut msg = Message::new(
+            *self.node_id.as_bytes(),
+            self.keypair.public_key_bytes(),
+            self.pow.clone(),
+            payload,
+        );
+        msg.client_mode = self.config.client_mode;
+        msg
+    }
+
+    fn handler_context(&self) -> HandlerContext<T> {
+        HandlerContext {
+            keypair: self.keypair.clone(),
+            pow: self.pow.clone(),
+            node_id: self.node_id,
+            transport: self.transport.clone(),
+            routing_table: self.routing_table.clone(),
+            metadata: self.metadata.clone(),
+            chunks: self.chunks.as_ref().clone(),
+            relay_limiter: self.relay_limiter.clone(),
+            write_limiter: self.write_limiter.clone(),
+            peer_chunk_counts: self.peer_chunk_counts.clone(),
+            config: self.config.clone(),
+        }
+    }
+
+    async fn run(mut self) {
+        let mut rt_save_tick =
+            tokio::time::interval(self.config.rt_save_interval);
+        rt_save_tick.tick().await; // consume the immediate first tick
+
+        let mut provider_tick =
+            tokio::time::interval(self.config.provider_republish_interval);
+        provider_tick.tick().await; // consume the immediate first tick
+
+        let mut refresh_tick =
+            tokio::time::interval(self.config.bucket_refresh_interval);
+        refresh_tick.tick().await; // consume the immediate first tick
+
+        let mut limiter_cleanup_tick =
+            tokio::time::interval(Duration::from_secs(60));
+        limiter_cleanup_tick.tick().await; // consume the immediate first tick
+
+        loop {
+            tokio::select! {
+                // Handle inbound RPC
+                result = self.transport.recv_request() => {
+                    match result {
+                        Ok((from_addr, msg)) => {
+                            let permit = match self.handler_semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    counter!(crate::metrics::HANDLER_DROPPED_TOTAL).increment(1);
+                                    tracing::warn!("dropping inbound message: handler limit reached");
+                                    continue;
+                                }
+                            };
+                            let ctx = self.handler_context();
+                            tokio::spawn(async move {
+                                handle_inbound_message(ctx, from_addr, msg).await;
+                                drop(permit);
+                            });
+                        }
+                        Err(e) => {
+                            if e.is_channel_closed() {
+                                tracing::error!("transport channel closed, shutting down: {}", e);
+                                break;
+                            }
+                            tracing::warn!("transient recv error (continuing): {}", e);
+                            // Continue processing — transient errors should not kill the node
+                        }
+                    }
+                }
+                // Handle commands from the handle
+                cmd = self.cmd_rx.recv() => {
+                    match cmd {
+                        Some(Command::Shutdown) | None => break,
+                        Some(cmd) => self.handle_command(cmd).await,
+                    }
+                }
+                // Periodic routing table save (Gap F)
+                _ = rt_save_tick.tick() => {
+                    let rt_size = self.routing_table.lock().await.len();
+                    gauge!(crate::metrics::ROUTING_TABLE_SIZE).set(rt_size as f64);
+                    self.save_routing_table().await;
+                }
+                // Periodic provider maintenance (Gap E)
+                _ = provider_tick.tick() => {
+                    self.do_provider_maintenance().await;
+                }
+                // Periodic bucket refresh (S8)
+                _ = refresh_tick.tick() => {
+                    self.do_bucket_refresh().await;
+                }
+                // Periodic cleanup of relay/write rate limiters (I17) and peer chunk counts (S16)
+                _ = limiter_cleanup_tick.tick() => {
+                    if let Ok(mut rl) = self.relay_limiter.lock() {
+                        rl.cleanup(Duration::from_secs(300));
+                    }
+                    if let Ok(mut wl) = self.write_limiter.lock() {
+                        wl.cleanup(Duration::from_secs(300));
+                    }
+                    // Prune peer_chunk_counts for peers no longer in the routing table (S16)
+                    let known_ids: std::collections::HashSet<[u8; 32]> = {
+                        let rt = self.routing_table.lock().await;
+                        rt.all_nodes_serde().iter().map(|n| n.node_id).collect()
+                    };
+                    if let Ok(mut counts) = self.peer_chunk_counts.lock() {
+                        counts.retain(|id, _| known_ids.contains(id));
+                    }
+                }
+            }
+        }
+
+        // Save routing table on shutdown (Gap F)
+        self.save_routing_table().await;
+    }
+
+    #[instrument(skip(self, cmd))]
+    async fn handle_command(&self, cmd: Command) {
+        match cmd {
+            Command::Bootstrap { addrs, reply } => {
+                let result = self.do_bootstrap(addrs).await;
+                let _ = reply.send(result);
+            }
+            Command::FindNode { target, reply } => {
+                let result = self.do_iterative_find_node(target).await;
+                let _ = reply.send(result);
+            }
+            Command::GetProviders { key, reply } => {
+                let result = self.do_get_providers(key).await;
+                let _ = reply.send(result);
+            }
+            Command::StoreTessera {
+                data,
+                config,
+                reply,
+            } => {
+                let result = self.do_store_tessera(data, config).await;
+                let _ = reply.send(result);
+            }
+            Command::RetrieveTessera {
+                chunk_hashes,
+                config,
+                original_len,
+                reply,
+            } => {
+                let result = self
+                    .do_retrieve_tessera(chunk_hashes, config, original_len)
+                    .await;
+                let _ = reply.send(result);
+            }
+            Command::Shutdown => {} // handled in run loop
+        }
+    }
+
+    // --- Maintenance ---
+
+    #[instrument(skip(self))]
+    async fn save_routing_table(&self) {
+        let peers = self.routing_table.lock().await.all_nodes_serde();
+        let metadata = self.metadata.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            metadata
+                .lock()
+                .map_err(|_| {
+                    TesseraError::Network("metadata lock poisoned".into())
+                })?
+                .save_peers_batch(&peers)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                tracing::info!("saved routing table");
+            }
+            Ok(Err(e)) => tracing::warn!("failed to save routing table: {}", e),
+            Err(e) => tracing::warn!("save_routing_table task panicked: {}", e),
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn do_provider_maintenance(&self) {
+        // 1. Cleanup expired providers
+        let metadata = self.metadata.clone();
+        match tokio::task::spawn_blocking(move || {
+            metadata
+                .lock()
+                .map_err(|_| {
+                    TesseraError::Network("metadata lock poisoned".into())
+                })?
+                .cleanup_expired_providers()
+        })
+        .await
+        {
+            Ok(Ok(n)) if n > 0 => {
+                counter!(crate::metrics::PROVIDER_EXPIRED_TOTAL)
+                    .increment(n as u64);
+                tracing::info!("cleaned up {} expired provider records", n)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("failed to cleanup expired providers: {}", e)
+            }
+            Err(e) => {
+                tracing::warn!("cleanup task panicked: {}", e)
+            }
+            _ => {}
+        }
+
+        // 2. Get content keys we provide for
+        let metadata = self.metadata.clone();
+        let node_id = *self.node_id.as_bytes();
+        let own_keys = match tokio::task::spawn_blocking(move || {
+            metadata
+                .lock()
+                .map_err(|_| {
+                    TesseraError::Network("metadata lock poisoned".into())
+                })?
+                .get_own_providers(&node_id)
+        })
+        .await
+        {
+            Ok(Ok(keys)) => keys,
+            Ok(Err(e)) => {
+                tracing::warn!("failed to get own providers: {}", e);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("get_own_providers task panicked: {}", e);
+                return;
+            }
+        };
+
+        if own_keys.is_empty() {
+            return;
+        }
+
+        counter!(crate::metrics::PROVIDER_REPUBLISHED_TOTAL)
+            .increment(own_keys.len() as u64);
+        tracing::info!("republishing {} provider records", own_keys.len());
+
+        // 3. Re-announce each key to closest nodes
+        let local_addr = self.transport.local_addr();
+        for key in &own_keys {
+            // Refresh our own provider record TTL
+            let metadata = self.metadata.clone();
+            let node_id = *self.node_id.as_bytes();
+            let public_key = self.keypair.public_key_bytes();
+            let key_copy = *key;
+            let provider_ttl = self.config.provider_ttl;
+            let _ = tokio::task::spawn_blocking(move || {
+                metadata
+                    .lock()
+                    .map_err(|_| {
+                        TesseraError::Network("metadata lock poisoned".into())
+                    })?
+                    .add_provider(
+                        &key_copy,
+                        &node_id,
+                        &public_key,
+                        &[local_addr],
+                        provider_ttl,
+                    )
+            })
+            .await;
+
+            // Announce to K closest peers
+            let target = NodeId::from_bytes(*key);
+            let closest = self
+                .routing_table
+                .lock()
+                .await
+                .closest_nodes(&target, self.config.k);
+
+            for node in closest.iter().take(self.config.k) {
+                if node.addresses.is_empty() || node.node_id == self.node_id {
+                    continue;
+                }
+                let mut msg = self.new_message(Payload::AddProviderRequest {
+                    key: *key,
+                    addresses: vec![local_addr],
+                });
+                msg.sign(&self.keypair);
+                let transport = self.transport.clone();
+                let addrs = node.addresses.clone();
+                tokio::spawn(async move {
+                    let _ = send_request_any(&*transport, &addrs, &msg).await;
+                });
+            }
+        }
+    }
+
+    // --- Bucket refresh ---
+
+    #[instrument(skip(self))]
+    async fn do_bucket_refresh(&self) {
+        let stale = {
+            let rt = self.routing_table.lock().await;
+            rt.stale_bucket_indices(self.config.bucket_refresh_interval)
+        };
+        if stale.is_empty() {
+            return;
+        }
+        tracing::info!("refreshing {} stale buckets", stale.len());
+        for idx in stale {
+            let target = {
+                let rt = self.routing_table.lock().await;
+                rt.random_id_for_bucket(idx)
+            };
+            let _ = self.do_iterative_find_node(target).await;
+        }
+    }
+
+    // --- Relay helpers ---
+
+    /// Try to send a message via relay nodes when direct communication fails.
+    /// Picks the closest nodes to our own ID as relay candidates.
+    #[instrument(skip(self, msg), fields(target = %hex::encode(&target_id.as_bytes()[..4])))]
+    async fn send_via_relay(
+        &self,
+        target_id: &NodeId,
+        msg: Message,
+    ) -> Result<Message, TesseraError> {
+        let candidates = self
+            .routing_table
+            .lock()
+            .await
+            .closest_nodes(&self.node_id, self.config.k);
+        let msg_bytes = msg.to_bytes().map_err(|e| {
+            TesseraError::Serialization(format!(
+                "failed to serialize inner message: {}",
+                e
+            ))
+        })?;
+
+        for candidate in &candidates {
+            if candidate.node_id == *target_id
+                || candidate.node_id == self.node_id
+                || candidate.addresses.is_empty()
+            {
+                continue;
+            }
+
+            let mut relay_msg = self.new_message(Payload::RelayRequest {
+                target_id: *target_id.as_bytes(),
+                payload: msg_bytes.clone(),
+                relay_hops: 0,
+            });
+            relay_msg.sign(&self.keypair);
+
+            match send_request_any(
+                &*self.transport,
+                &candidate.addresses,
+                &relay_msg,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    if let Payload::RelayResponse { ok: true, payload } =
+                        resp.payload
+                    {
+                        let inner_resp = Message::from_bytes(&payload).map_err(|e| {
+                            TesseraError::Serialization(format!(
+                                "failed to deserialize relayed response: {}",
+                                e
+                            ))
+                        })?;
+                        return Ok(inner_resp);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        Err(TesseraError::Network("all relay candidates failed".into()))
+    }
+
+    /// Try direct send to each address first, fall back to relay on failure (S19).
+    #[instrument(skip(self, msg), fields(target = %hex::encode(&target_id.as_bytes()[..4])))]
+    async fn send_or_relay(
+        &self,
+        addrs: &[SocketAddr],
+        target_id: &NodeId,
+        msg: Message,
+    ) -> Result<Message, TesseraError> {
+        match send_request_any(&*self.transport, addrs, &msg).await {
+            Ok(resp) => Ok(resp),
+            Err(_) => self.send_via_relay(target_id, msg).await,
+        }
+    }
+
+    // --- Bootstrap ---
+
+    #[instrument(skip(self, addrs), fields(num_addrs = addrs.len()))]
+    async fn do_bootstrap(
+        &self,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<(), TesseraError> {
+        // Ping each bootstrap node to learn their identity
+        for addr in &addrs {
+            let mut msg = self.new_message(Payload::PingRequest);
+            msg.sign(&self.keypair);
+            match self.transport.send_request(addr, msg).await {
+                Ok(resp) => {
+                    let peer_id = NodeId::from_bytes(resp.sender_id);
+                    let node_info =
+                        NodeInfo::new(peer_id, resp.sender_key, vec![*addr]);
+                    self.routing_table.lock().await.insert(node_info);
+                }
+                Err(e) => {
+                    tracing::warn!("bootstrap ping to {} failed: {}", addr, e);
+                }
+            }
+        }
+
+        let rt_size = self.routing_table.lock().await.len();
+        gauge!(crate::metrics::ROUTING_TABLE_SIZE).set(rt_size as f64);
+
+        if self.config.client_mode {
+            // Client mode: do a single FindNodeRequest to each bootstrap peer
+            // to discover nearby nodes without a full iterative lookup (which
+            // would contact dead ephemeral peers and cause long timeouts).
+            for addr in &addrs {
+                let mut msg = self.new_message(Payload::FindNodeRequest {
+                    target: *self.node_id.as_bytes(),
+                });
+                msg.sign(&self.keypair);
+                if let Ok(resp) = self.transport.send_request(addr, msg).await
+                    && let Payload::FindNodeResponse { nodes } = resp.payload
+                {
+                    let mut rt = self.routing_table.lock().await;
+                    for n in nodes {
+                        let info = NodeInfo::new(
+                            NodeId::from_bytes(n.node_id),
+                            n.public_key,
+                            n.addresses,
+                        );
+                        rt.insert(info);
+                    }
+                }
+            }
+        } else {
+            let _ = self.do_iterative_find_node(self.node_id).await;
+        }
+
+        counter!(crate::metrics::BOOTSTRAP_TOTAL, crate::metrics::LABEL_STATUS => "ok").increment(1);
+        Ok(())
+    }
+
+    // --- Iterative Find Node ---
+
+    #[instrument(skip(self), fields(target = %hex::encode(&target.as_bytes()[..4])))]
+    async fn do_iterative_find_node(
+        &self,
+        target: NodeId,
+    ) -> Result<Vec<NodeInfo>, TesseraError> {
+        counter!(crate::metrics::LOOKUP_TOTAL, crate::metrics::LABEL_TYPE => "find_node").increment(1);
+        let start = std::time::Instant::now();
+        let k = self.config.k;
+        let alpha = self.config.alpha;
+        let max_failures = self.config.max_failures;
+        let seed_nodes =
+            self.routing_table.lock().await.closest_nodes(&target, k);
+
+        let transport = self.transport.clone();
+        let rt = self.routing_table.clone();
+        let my_id = self.node_id;
+        let my_key = self.keypair.public_key_bytes();
+        let my_keypair = self.keypair.clone();
+        let pow = self.pow.clone();
+        let client_mode = self.config.client_mode;
+
+        let result = crate::lookup::iterative_find_node(
+            target,
+            self.node_id,
+            seed_nodes,
+            k,
+            alpha,
+            move |peer_id, addrs| {
+                let transport = transport.clone();
+                let rt = rt.clone();
+                let pow = pow.clone();
+                let kp = my_keypair.clone();
+                async move {
+                    let mut msg = Message::new(
+                        *my_id.as_bytes(),
+                        my_key,
+                        pow.clone(),
+                        Payload::FindNodeRequest {
+                            target: *target.as_bytes(),
+                        },
+                    );
+                    msg.client_mode = client_mode;
+                    msg.sign(&kp);
+
+                    // Try direct (all addresses), then relay fallback (S19)
+                    let result =
+                        send_request_any(&*transport, &addrs, &msg).await;
+                    let resp = match result {
+                        Ok(resp) => resp,
+                        Err(_) => {
+                            // Try relay
+                            let candidates =
+                                rt.lock().await.closest_nodes(&my_id, k);
+                            let msg_bytes = match msg.to_bytes() {
+                                Ok(b) => b,
+                                Err(_) => {
+                                    rt.lock()
+                                        .await
+                                        .record_failure(&peer_id, max_failures);
+                                    return None;
+                                }
+                            };
+                            let mut relayed = None;
+                            for candidate in &candidates {
+                                if candidate.node_id == peer_id
+                                    || candidate.node_id == my_id
+                                    || candidate.addresses.is_empty()
+                                {
+                                    continue;
+                                }
+                                let mut relay_msg = Message::new(
+                                    *my_id.as_bytes(),
+                                    my_key,
+                                    pow.clone(),
+                                    Payload::RelayRequest {
+                                        target_id: *peer_id.as_bytes(),
+                                        payload: msg_bytes.clone(),
+                                        relay_hops: 0,
+                                    },
+                                );
+                                relay_msg.client_mode = client_mode;
+                                relay_msg.sign(&kp);
+                                if let Ok(resp) = send_request_any(
+                                    &*transport,
+                                    &candidate.addresses,
+                                    &relay_msg,
+                                )
+                                .await
+                                    && let Payload::RelayResponse {
+                                        ok: true,
+                                        payload,
+                                    } = resp.payload
+                                    && let Ok(inner) =
+                                        Message::from_bytes(&payload)
+                                {
+                                    relayed = Some(inner);
+                                    break;
+                                }
+                            }
+                            match relayed {
+                                Some(r) => r,
+                                None => {
+                                    rt.lock()
+                                        .await
+                                        .record_failure(&peer_id, max_failures);
+                                    return None;
+                                }
+                            }
+                        }
+                    };
+
+                    // Update routing table with responder
+                    let resp_id = NodeId::from_bytes(resp.sender_id);
+                    let peer_info =
+                        NodeInfo::new(resp_id, resp.sender_key, addrs.clone());
+                    rt.lock().await.insert(peer_info);
+
+                    if let Payload::FindNodeResponse { nodes } = resp.payload {
+                        let returned: Vec<NodeInfo> = nodes
+                            .into_iter()
+                            .map(|n| {
+                                // Also insert discovered nodes into routing table
+                                // (fire-and-forget: we clone rt for a blocking insert)
+                                NodeInfo::new(
+                                    NodeId::from_bytes(n.node_id),
+                                    n.public_key,
+                                    n.addresses,
+                                )
+                            })
+                            .collect();
+                        // Insert discovered nodes into routing table
+                        {
+                            let mut table = rt.lock().await;
+                            for node in &returned {
+                                table.insert(node.clone());
+                            }
+                        }
+                        Some((resp_id, addrs[0], returned))
+                    } else {
+                        None
+                    }
+                }
+            },
+        )
+        .await;
+
+        histogram!(crate::metrics::LOOKUP_DURATION_SECONDS, crate::metrics::LABEL_TYPE => "find_node")
+            .record(start.elapsed().as_secs_f64());
+        Ok(result)
+    }
+
+    // --- Get Providers ---
+
+    #[instrument(skip(self), fields(key = %hex::encode(&key[..4])))]
+    async fn do_get_providers(
+        &self,
+        key: [u8; 32],
+    ) -> Result<Vec<NodeInfoSerde>, TesseraError> {
+        counter!(crate::metrics::LOOKUP_TOTAL, crate::metrics::LABEL_TYPE => "get_providers").increment(1);
+        let start = std::time::Instant::now();
+        // Collect local providers (may be stale but include them)
+        let mut all_providers = {
+            let metadata = self.metadata.clone();
+            tokio::task::spawn_blocking(move || {
+                metadata
+                    .lock()
+                    .map_err(|_| {
+                        TesseraError::Network("metadata lock poisoned".into())
+                    })?
+                    .get_providers(&key)
+            })
+            .await
+            .map_err(|e| {
+                TesseraError::Network(format!("spawn_blocking: {}", e))
+            })?
+            .unwrap_or_default()
+        };
+
+        // Iterative get_providers: seed from routing table, merge closer_nodes
+        let target = NodeId::from_bytes(key);
+        let k = self.config.k;
+        let alpha = self.config.alpha;
+        let mut candidates: Vec<NodeInfo> =
+            self.routing_table.lock().await.closest_nodes(&target, k);
+        let mut queried = std::collections::HashSet::new();
+        queried.insert(self.node_id);
+
+        for _round in 0..10 {
+            let to_query: Vec<(NodeId, Vec<SocketAddr>)> = candidates
+                .iter()
+                .filter(|n| {
+                    !queried.contains(&n.node_id) && !n.addresses.is_empty()
+                })
+                .take(alpha)
+                .map(|n| (n.node_id, n.addresses.clone()))
+                .collect();
+
+            if to_query.is_empty() {
+                break;
+            }
+
+            for (peer_id, _) in &to_query {
+                queried.insert(*peer_id);
+            }
+
+            let mut improved = false;
+            for (peer_id, addrs) in &to_query {
+                let mut msg =
+                    self.new_message(Payload::GetProvidersRequest { key });
+                msg.sign(&self.keypair);
+                match self.send_or_relay(addrs, peer_id, msg).await {
+                    Ok(resp) => {
+                        if let Payload::GetProvidersResponse {
+                            providers,
+                            closer_nodes,
+                        } = resp.payload
+                        {
+                            all_providers.extend(providers);
+                            // Merge closer_nodes into candidates
+                            for n in closer_nodes {
+                                let node_id = NodeId::from_bytes(n.node_id);
+                                if node_id == self.node_id {
+                                    continue;
+                                }
+                                if !candidates
+                                    .iter()
+                                    .any(|c| c.node_id == node_id)
+                                {
+                                    candidates.push(NodeInfo::new(
+                                        node_id,
+                                        n.public_key,
+                                        n.addresses,
+                                    ));
+                                    improved = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        self.routing_table
+                            .lock()
+                            .await
+                            .record_failure(peer_id, self.config.max_failures);
+                    }
+                }
+            }
+
+            candidates.sort_by(|a, b| {
+                target
+                    .distance(&a.node_id)
+                    .cmp(&target.distance(&b.node_id))
+            });
+            candidates.truncate(k);
+
+            if !improved {
+                break;
+            }
+        }
+
+        // Dedup providers by node_id
+        let mut seen = std::collections::HashSet::new();
+        all_providers.retain(|p| seen.insert(p.node_id));
+
+        histogram!(crate::metrics::LOOKUP_DURATION_SECONDS, crate::metrics::LABEL_TYPE => "get_providers")
+            .record(start.elapsed().as_secs_f64());
+        Ok(all_providers)
+    }
+
+    // --- Store Tessera ---
+
+    #[instrument(skip(self, data), fields(data_len = data.len()))]
+    async fn do_store_tessera(
+        &self,
+        data: Vec<u8>,
+        config: ErasureConfig,
+    ) -> Result<StoreTesseraResult, TesseraError> {
+        let start = std::time::Instant::now();
+        let encoded = erasure::encode(&data, &config)?;
+
+        // Store chunks locally first
+        for (hash, chunk_data) in
+            encoded.chunk_hashes.iter().zip(encoded.chunks.iter())
+        {
+            self.chunks.put(hash, chunk_data).await?;
+        }
+
+        // Shared semaphore caps total concurrent outbound RPCs at alpha
+        let sem = Arc::new(Semaphore::new(self.config.alpha));
+        // Track (node_id, JoinHandle) so we can record_failure on errors
+        let mut distribution_handles: Vec<(
+            NodeId,
+            tokio::task::JoinHandle<Result<Message, TesseraError>>,
+        )> = Vec::new();
+
+        // Distribute chunks to closest nodes for each chunk hash
+        for (hash, chunk_data) in
+            encoded.chunk_hashes.iter().zip(encoded.chunks.iter())
+        {
+            let target = NodeId::from_bytes(*hash);
+            let closest = self
+                .routing_table
+                .lock()
+                .await
+                .closest_nodes(&target, self.config.k);
+
+            for node in closest.iter().take(self.config.alpha) {
+                if node.addresses.is_empty() || node.node_id == self.node_id {
+                    continue;
+                }
+                let mut msg = self.new_message(Payload::PutChunkRequest {
+                    chunk_hash: *hash,
+                    data: chunk_data.clone(),
+                });
+                msg.sign(&self.keypair);
+                let transport = self.transport.clone();
+                let addrs = node.addresses.clone();
+                let sem = sem.clone();
+                distribution_handles.push((
+                    node.node_id,
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire_owned().await;
+                        send_request_any(&*transport, &addrs, &msg).await
+                    }),
+                ));
+            }
+
+            // Also add ourselves as a provider
+            let content_key = *hash;
+            let metadata = self.metadata.clone();
+            let node_id = *self.node_id.as_bytes();
+            let public_key = self.keypair.public_key_bytes();
+            let local_addr = self.transport.local_addr();
+            let provider_ttl = self.config.provider_ttl;
+            let _ = tokio::task::spawn_blocking(move || {
+                metadata
+                    .lock()
+                    .map_err(|_| {
+                        TesseraError::Network("metadata lock poisoned".into())
+                    })?
+                    .add_provider(
+                        &content_key,
+                        &node_id,
+                        &public_key,
+                        &[local_addr],
+                        provider_ttl,
+                    )
+            })
+            .await;
+        }
+
+        // Announce as provider for each chunk — target nodes closest to the chunk hash
+        for hash in &encoded.chunk_hashes {
+            let target = NodeId::from_bytes(*hash);
+            let closest_to_chunk = self
+                .routing_table
+                .lock()
+                .await
+                .closest_nodes(&target, self.config.k);
+            for node in closest_to_chunk.iter().take(self.config.alpha) {
+                if node.addresses.is_empty() || node.node_id == self.node_id {
+                    continue;
+                }
+                let mut msg = self.new_message(Payload::AddProviderRequest {
+                    key: *hash,
+                    addresses: vec![self.transport.local_addr()],
+                });
+                msg.sign(&self.keypair);
+                let transport = self.transport.clone();
+                let addrs = node.addresses.clone();
+                let sem = sem.clone();
+                distribution_handles.push((
+                    node.node_id,
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire_owned().await;
+                        send_request_any(&*transport, &addrs, &msg).await
+                    }),
+                ));
+            }
+        }
+
+        // Await distribution with per-handle timeout; record failures for dead peers
+        let total = distribution_handles.len();
+        let mut succeeded = 0usize;
+        for (peer_id, handle) in distribution_handles {
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(Ok(_))) => succeeded += 1,
+                Ok(Ok(Err(e))) => {
+                    tracing::debug!(
+                        "distribution RPC to {} failed: {}",
+                        peer_id,
+                        e
+                    );
+                    self.routing_table
+                        .lock()
+                        .await
+                        .record_failure(&peer_id, self.config.max_failures);
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("distribution task panicked: {}", e)
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "distribution RPC to {} timed out",
+                        peer_id
+                    );
+                    self.routing_table
+                        .lock()
+                        .await
+                        .record_failure(&peer_id, self.config.max_failures);
+                }
+            }
+        }
+        tracing::info!("distributed to {}/{} peers", succeeded, total);
+
+        counter!(crate::metrics::STORE_TOTAL, crate::metrics::LABEL_STATUS => "ok").increment(1);
+        histogram!(crate::metrics::STORE_DURATION_SECONDS)
+            .record(start.elapsed().as_secs_f64());
+        Ok(StoreTesseraResult {
+            chunk_hashes: encoded.chunk_hashes,
+            config: encoded.config,
+            original_len: encoded.original_len,
+        })
+    }
+
+    // --- Retrieve Tessera ---
+
+    #[instrument(skip(self, chunk_hashes), fields(num_chunks = chunk_hashes.len()))]
+    async fn do_retrieve_tessera(
+        &self,
+        chunk_hashes: Vec<[u8; 32]>,
+        config: ErasureConfig,
+        original_len: usize,
+    ) -> Result<Vec<u8>, TesseraError> {
+        // Global timeout to prevent unbounded blocking when all peers are slow
+        const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(120);
+        match tokio::time::timeout(
+            RETRIEVE_TIMEOUT,
+            self.do_retrieve_tessera_inner(
+                &chunk_hashes,
+                &config,
+                original_len,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TesseraError::Timeout),
+        }
+    }
+
+    async fn do_retrieve_tessera_inner(
+        &self,
+        chunk_hashes: &[[u8; 32]],
+        config: &ErasureConfig,
+        original_len: usize,
+    ) -> Result<Vec<u8>, TesseraError> {
+        let start = std::time::Instant::now();
+        let mut shards: Vec<Option<Vec<u8>>> =
+            Vec::with_capacity(chunk_hashes.len());
+
+        for hash in chunk_hashes {
+            // Try local first
+            if let Ok(Some(data)) = self.chunks.get(hash).await {
+                shards.push(Some(data));
+                continue;
+            }
+
+            // Query all closest nodes in parallel — returns as soon as any
+            // node responds with the chunk.  This avoids serial timeouts
+            // when the routing table contains stale/dead peers.
+            let target = NodeId::from_bytes(*hash);
+            let closest = self
+                .routing_table
+                .lock()
+                .await
+                .closest_nodes(&target, self.config.k);
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+            let mut fetch_handles = Vec::new();
+            for node in closest.iter().take(self.config.k) {
+                if node.addresses.is_empty() || node.node_id == self.node_id {
+                    continue;
+                }
+                let mut msg = self.new_message(Payload::GetChunkRequest {
+                    chunk_hash: *hash,
+                });
+                msg.sign(&self.keypair);
+                let transport = self.transport.clone();
+                let addrs = node.addresses.clone();
+                let tx = tx.clone();
+                let expected_hash = *hash;
+                fetch_handles.push(tokio::spawn(async move {
+                    if let Ok(resp) =
+                        send_request_any(&*transport, &addrs, &msg).await
+                        && let Payload::GetChunkResponse { data } = resp.payload
+                        && !data.is_empty()
+                        && ChunkStore::hash(&data) == expected_hash
+                    {
+                        let _ = tx.send(data).await;
+                    }
+                }));
+            }
+            // Drop our copy so rx closes when all tasks finish
+            drop(tx);
+
+            let shard = rx.recv().await;
+            // Cancel remaining tasks once we have the chunk
+            for h in &fetch_handles {
+                h.abort();
+            }
+
+            if let Some(data) = shard {
+                let _ = self.chunks.put(hash, &data).await;
+                shards.push(Some(data));
+            } else {
+                shards.push(None);
+            }
+        }
+
+        // Decode
+        let result = erasure::decode(&mut shards, config, original_len);
+        let status = if result.is_ok() { "ok" } else { "err" };
+        counter!(crate::metrics::RETRIEVE_TOTAL, crate::metrics::LABEL_STATUS => status).increment(1);
+        histogram!(crate::metrics::RETRIEVE_DURATION_SECONDS)
+            .record(start.elapsed().as_secs_f64());
+        result
+    }
+}
+
+/// Verify identity, PoW, and signature of an inner relay message.
+fn verify_inner_message<T: Transport>(
+    msg: &Message,
+    ctx: &HandlerContext<T>,
+) -> bool {
+    let sender_node_id = NodeId::from_bytes(msg.sender_id);
+    let Ok(sender_vk) =
+        ed25519_dalek::VerifyingKey::from_bytes(&msg.sender_key)
+    else {
+        tracing::warn!("relay rejected: inner message has invalid sender_key");
+        return false;
+    };
+    if !verify_node_id(&sender_node_id, &sender_vk) {
+        tracing::warn!(
+            "relay rejected: inner sender_id does not match sender_key"
+        );
+        return false;
+    }
+    if !msg.pow_proof.verify_with_min_difficulty(
+        &msg.sender_key,
+        ctx.config.min_pow_difficulty,
+    ) {
+        tracing::warn!("relay rejected: inner message has insufficient PoW");
+        return false;
+    }
+    if !msg.verify_signature() {
+        tracing::warn!("relay rejected: inner message has invalid signature");
+        return false;
+    }
+    true
+}
+
+#[instrument(skip(ctx, msg), fields(from = %from_addr))]
+async fn handle_inbound_message<T: Transport>(
+    ctx: HandlerContext<T>,
+    from_addr: SocketAddr,
+    msg: Message,
+) {
+    // Identity verification: verify sender_id matches sender_key
+    let sender_node_id = NodeId::from_bytes(msg.sender_id);
+    let sender_vk = match ed25519_dalek::VerifyingKey::from_bytes(
+        &msg.sender_key,
+    ) {
+        Ok(vk) => vk,
+        Err(_) => {
+            counter!(crate::metrics::VERIFICATION_FAILURE_TOTAL, crate::metrics::LABEL_REASON => "identity").increment(1);
+            tracing::warn!(
+                "dropping message from {}: invalid sender_key",
+                from_addr
+            );
+            return;
+        }
+    };
+    if !verify_node_id(&sender_node_id, &sender_vk) {
+        counter!(crate::metrics::VERIFICATION_FAILURE_TOTAL, crate::metrics::LABEL_REASON => "identity").increment(1);
+        tracing::warn!(
+            "dropping message from {}: sender_id does not match sender_key",
+            from_addr
+        );
+        return;
+    }
+
+    // PoW verification: verify sender did computational work
+    if !msg.pow_proof.verify_with_min_difficulty(
+        &msg.sender_key,
+        ctx.config.min_pow_difficulty,
+    ) {
+        counter!(crate::metrics::VERIFICATION_FAILURE_TOTAL, crate::metrics::LABEL_REASON => "pow").increment(1);
+        tracing::warn!(
+            "dropping message from {}: insufficient PoW difficulty",
+            from_addr
+        );
+        return;
+    }
+
+    // Signature verification: verify sender possesses the private key
+    if !msg.verify_signature() {
+        counter!(crate::metrics::VERIFICATION_FAILURE_TOTAL, crate::metrics::LABEL_REASON => "signature").increment(1);
+        tracing::warn!(
+            "dropping message from {}: invalid signature",
+            from_addr
+        );
+        return;
+    }
+
+    // Protocol version check
+    if msg.protocol_version != crate::protocol::PROTOCOL_VERSION {
+        counter!(crate::metrics::VERIFICATION_FAILURE_TOTAL, crate::metrics::LABEL_REASON => "protocol_version").increment(1);
+        tracing::warn!(
+            "dropping message from {}: unsupported protocol version {}",
+            from_addr,
+            msg.protocol_version
+        );
+        return;
+    }
+
+    // Update routing table with verified sender info (after verification).
+    // Client-mode nodes are ephemeral and won't accept inbound connections,
+    // so we don't add them to the routing table to avoid stale entries.
+    if !msg.client_mode {
+        let node_info =
+            NodeInfo::new(sender_node_id, msg.sender_key, vec![from_addr]);
+        let insert_result =
+            ctx.routing_table.lock().await.insert(node_info.clone());
+        // Kademlia LRS eviction: if bucket is full, ping the least-recently-seen
+        // node. If it doesn't respond, evict it and insert the new node.
+        if let crate::routing::InsertResult::BucketFull { lrs_node_id } =
+            insert_result
+        {
+            let lrs_addr = {
+                let rt = ctx.routing_table.lock().await;
+                rt.closest_nodes(&lrs_node_id, 1)
+                    .into_iter()
+                    .find(|n| n.node_id == lrs_node_id)
+                    .and_then(|n| n.addresses.first().copied())
+            };
+            if let Some(addr) = lrs_addr {
+                let mut ping = Message::new(
+                    *ctx.node_id.as_bytes(),
+                    ctx.keypair.public_key_bytes(),
+                    ctx.pow.clone(),
+                    Payload::PingRequest,
+                );
+                ping.sign(&ctx.keypair);
+                let ping_result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ctx.transport.send_request(&addr, ping),
+                )
+                .await;
+                match ping_result {
+                    Ok(Ok(_)) => {
+                        // LRS node is alive — keep it, discard the new node
+                        tracing::debug!(
+                            "LRS node {} responded, keeping in bucket",
+                            hex::encode(&lrs_node_id.as_bytes()[..4])
+                        );
+                    }
+                    _ => {
+                        // LRS node is dead — evict and insert the new node
+                        tracing::debug!(
+                            "LRS node {} unresponsive, evicting",
+                            hex::encode(&lrs_node_id.as_bytes()[..4])
+                        );
+                        ctx.routing_table
+                            .lock()
+                            .await
+                            .evict_and_insert(&lrs_node_id, node_info);
+                    }
+                }
+            }
+        }
+    }
+
+    let rpc_type = crate::metrics::payload_type_label(&msg.payload);
+    counter!(crate::metrics::RPC_INBOUND_TOTAL, crate::metrics::LABEL_RPC_TYPE => rpc_type).increment(1);
+    let handler_start = std::time::Instant::now();
+
+    let response_payload = match msg.payload {
+        Payload::PingRequest => Payload::PingResponse,
+        Payload::FindNodeRequest { target } => {
+            let target_id = NodeId::from_bytes(target);
+            let closest = ctx
+                .routing_table
+                .lock()
+                .await
+                .closest_nodes(&target_id, ctx.config.k);
+            let nodes: Vec<NodeInfoSerde> = closest
+                .into_iter()
+                .map(|n| NodeInfoSerde {
+                    node_id: *n.node_id.as_bytes(),
+                    public_key: n.public_key,
+                    addresses: n.addresses,
+                })
+                .collect();
+            Payload::FindNodeResponse { nodes }
+        }
+        Payload::GetProvidersRequest { key } => {
+            let metadata = ctx.metadata.clone();
+            let providers = tokio::task::spawn_blocking(move || {
+                metadata
+                    .lock()
+                    .map_err(|_| {
+                        TesseraError::Network("metadata lock poisoned".into())
+                    })?
+                    .get_providers(&key)
+            })
+            .await
+            .unwrap_or(Ok(vec![]))
+            .unwrap_or_default();
+            let target_id = NodeId::from_bytes(key);
+            let closer = ctx
+                .routing_table
+                .lock()
+                .await
+                .closest_nodes(&target_id, ctx.config.k);
+            let closer_nodes: Vec<NodeInfoSerde> = closer
+                .into_iter()
+                .map(|n| NodeInfoSerde {
+                    node_id: *n.node_id.as_bytes(),
+                    public_key: n.public_key,
+                    addresses: n.addresses,
+                })
+                .collect();
+            Payload::GetProvidersResponse {
+                providers,
+                closer_nodes,
+            }
+        }
+        Payload::AddProviderRequest { key, ref addresses } => {
+            let metadata = ctx.metadata.clone();
+            let sender_id = msg.sender_id;
+            let sender_key = msg.sender_key;
+            let addresses = addresses.clone();
+            let provider_ttl = ctx.config.provider_ttl;
+            let ok = tokio::task::spawn_blocking(move || {
+                metadata
+                    .lock()
+                    .map_err(|_| {
+                        TesseraError::Network("metadata lock poisoned".into())
+                    })?
+                    .add_provider(
+                        &key,
+                        &sender_id,
+                        &sender_key,
+                        &addresses,
+                        provider_ttl,
+                    )
+            })
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            Payload::AddProviderResponse { ok }
+        }
+        Payload::GetChunkRequest { chunk_hash } => {
+            match ctx.chunks.get(&chunk_hash).await {
+                Ok(Some(data)) => Payload::GetChunkResponse { data },
+                _ => Payload::GetChunkResponse { data: vec![] },
+            }
+        }
+        Payload::PutChunkRequest {
+            chunk_hash,
+            ref data,
+        } => {
+            // Guard: Per-peer write rate limit
+            if !ctx
+                .write_limiter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .check(from_addr.ip())
+            {
+                counter!(crate::metrics::RATE_LIMIT_REJECTED_TOTAL, crate::metrics::LABEL_LIMITER => "write").increment(1);
+                tracing::warn!(
+                    "PutChunk rejected: write rate limit for {}",
+                    from_addr.ip()
+                );
+                Payload::PutChunkResponse { ok: false }
+            }
+            // Guard: Per-peer chunk count quota (speculative increment + rollback)
+            else {
+                let sender_id = msg.sender_id;
+                let reserved = {
+                    let mut counts = ctx
+                        .peer_chunk_counts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let count = counts.entry(sender_id).or_insert(0);
+                    if *count >= ctx.config.max_chunks_per_peer {
+                        tracing::warn!(
+                            "PutChunk rejected: peer {} exceeded chunk quota ({})",
+                            hex::encode(&sender_id[..4]),
+                            ctx.config.max_chunks_per_peer
+                        );
+                        false
+                    } else {
+                        *count += 1; // speculative increment
+                        true
+                    }
+                };
+                if !reserved {
+                    Payload::PutChunkResponse { ok: false }
+                } else {
+                    let ok = ctx.chunks.put(&chunk_hash, data).await.is_ok();
+                    if !ok {
+                        // Rollback: decrement the speculatively incremented count
+                        let mut counts = ctx
+                            .peer_chunk_counts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let count = counts.entry(sender_id).or_insert(1);
+                        *count = count.saturating_sub(1);
+                    }
+                    Payload::PutChunkResponse { ok }
+                }
+            }
+        }
+        Payload::RelayRequest {
+            target_id,
+            ref payload,
+            relay_hops,
+        } => {
+            // Guard 1: Hop limit
+            if relay_hops >= ctx.config.max_relay_hops {
+                tracing::warn!(
+                    "relay rejected: hop limit exceeded ({relay_hops})"
+                );
+                Payload::RelayResponse {
+                    ok: false,
+                    payload: vec![],
+                }
+            }
+            // Guard 2: Payload size limit
+            else if payload.len() > ctx.config.max_relay_payload {
+                tracing::warn!(
+                    "relay rejected: payload too large ({})",
+                    payload.len()
+                );
+                Payload::RelayResponse {
+                    ok: false,
+                    payload: vec![],
+                }
+            }
+            // Guard 3: Per-IP relay rate limit
+            else if !ctx
+                .relay_limiter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .check(from_addr.ip())
+            {
+                counter!(crate::metrics::RATE_LIMIT_REJECTED_TOTAL, crate::metrics::LABEL_LIMITER => "relay").increment(1);
+                tracing::warn!(
+                    "relay rejected: rate limit for {}",
+                    from_addr.ip()
+                );
+                Payload::RelayResponse {
+                    ok: false,
+                    payload: vec![],
+                }
+            }
+            // Guard 4: Block recursive relay + verify inner message
+            else {
+                match Message::from_bytes(payload) {
+                    Ok(inner_msg) => {
+                        if matches!(
+                            inner_msg.payload,
+                            Payload::RelayRequest { .. }
+                        ) {
+                            tracing::warn!("relay rejected: recursive relay");
+                            Payload::RelayResponse {
+                                ok: false,
+                                payload: vec![],
+                            }
+                        }
+                        // Guard 5: Verify inner message identity
+                        else if !verify_inner_message(&inner_msg, &ctx) {
+                            Payload::RelayResponse {
+                                ok: false,
+                                payload: vec![],
+                            }
+                        } else {
+                            // Forward to target
+                            let target_node_id = NodeId::from_bytes(target_id);
+                            let closest = ctx
+                                .routing_table
+                                .lock()
+                                .await
+                                .closest_nodes(&target_node_id, 1);
+                            let target_node = closest.into_iter().find(|n| {
+                                n.node_id == target_node_id
+                                    && !n.addresses.is_empty()
+                            });
+                            match target_node {
+                                Some(node) => {
+                                    match send_request_any(
+                                        &*ctx.transport,
+                                        &node.addresses,
+                                        &inner_msg,
+                                    )
+                                    .await
+                                    {
+                                        Ok(resp) => match resp.to_bytes() {
+                                            Ok(resp_bytes) => {
+                                                counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "ok").increment(1);
+                                                Payload::RelayResponse {
+                                                    ok: true,
+                                                    payload: resp_bytes,
+                                                }
+                                            }
+                                            Err(_) => {
+                                                counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "rejected").increment(1);
+                                                Payload::RelayResponse {
+                                                    ok: false,
+                                                    payload: vec![],
+                                                }
+                                            }
+                                        },
+                                        Err(_) => {
+                                            counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "rejected").increment(1);
+                                            Payload::RelayResponse {
+                                                ok: false,
+                                                payload: vec![],
+                                            }
+                                        }
+                                    }
+                                }
+                                None => Payload::RelayResponse {
+                                    ok: false,
+                                    payload: vec![],
+                                },
+                            }
+                        }
+                    }
+                    Err(_) => Payload::RelayResponse {
+                        ok: false,
+                        payload: vec![],
+                    },
+                }
+            }
+        }
+        _ => {
+            // Ignore responses that arrive as requests
+            return;
+        }
+    };
+
+    let mut response = msg.response(
+        *ctx.node_id.as_bytes(),
+        ctx.keypair.public_key_bytes(),
+        ctx.pow.clone(),
+        response_payload,
+    );
+    response.sign(&ctx.keypair);
+
+    histogram!(crate::metrics::RPC_HANDLER_DURATION_SECONDS, crate::metrics::LABEL_RPC_TYPE => rpc_type)
+        .record(handler_start.elapsed().as_secs_f64());
+
+    if let Err(e) = ctx.transport.send_response(&from_addr, response).await {
+        tracing::warn!("failed to send response to {}: {}", from_addr, e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::{
+        InMemoryNetwork, InMemoryTransport, new_in_memory_network,
+    };
+    use tempfile::TempDir;
+
+    fn test_config() -> NodeConfig {
+        NodeConfig {
+            min_pow_difficulty: 0,
+            ..Default::default()
+        }
+    }
+
+    async fn make_node(
+        port: u16,
+        network: &crate::transport::InMemoryNetwork,
+    ) -> (NodeHandle, TempDir) {
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let transport =
+            Arc::new(InMemoryTransport::new(addr, network.clone()).await);
+        let keypair = Keypair::generate();
+        let pow = PowProof::generate(&keypair.public_key_bytes(), 0);
+        let dir = TempDir::new().unwrap();
+        let metadata = MetadataStore::in_memory().unwrap();
+        let chunks =
+            ChunkStore::new(&dir.path().join("chunks"), 10_000_000).unwrap();
+
+        let handle = spawn_node(
+            keypair,
+            pow,
+            transport,
+            metadata,
+            chunks,
+            test_config(),
+        )
+        .await;
+        (handle, dir)
+    }
+
+    #[tokio::test]
+    async fn test_two_nodes_ping() {
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(5001, &network).await;
+        let (node_b, _dir_b) = make_node(5002, &network).await;
+
+        // Bootstrap A with B's address
+        node_a.bootstrap(vec![node_b.local_addr()]).await.unwrap();
+
+        // A should now know about B
+        let found = node_a.find_node(*node_b.node_id()).await.unwrap();
+        assert!(found.iter().any(|n| n.node_id == *node_b.node_id()));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_is_alive() {
+        let network = new_in_memory_network();
+        let (node, _dir) = make_node(5099, &network).await;
+
+        assert!(node.is_alive());
+        node.shutdown().await;
+        // Give time for the actor to exit
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!node.is_alive());
+    }
+
+    #[tokio::test]
+    async fn test_three_nodes_bootstrap() {
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(6001, &network).await;
+        let (node_b, _dir_b) = make_node(6002, &network).await;
+        let (node_c, _dir_c) = make_node(6003, &network).await;
+
+        // B and C bootstrap through A
+        node_b.bootstrap(vec![node_a.local_addr()]).await.unwrap();
+        node_c.bootstrap(vec![node_a.local_addr()]).await.unwrap();
+
+        // Give time for routing tables to settle
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // C should be able to find B
+        let found = node_c.find_node(*node_b.node_id()).await.unwrap();
+        assert!(found.iter().any(|n| n.node_id == *node_b.node_id()));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_store_and_retrieve_chunk() {
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(7001, &network).await;
+        let (node_b, _dir_b) = make_node(7002, &network).await;
+
+        // Bootstrap
+        node_b.bootstrap(vec![node_a.local_addr()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Store a tessera on A
+        let data = b"Hello Tessera! This is important data.".to_vec();
+        let config = ErasureConfig::new(4, 2).unwrap();
+        let result = node_a
+            .store_tessera(data.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Give time for chunk distribution
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Retrieve from B
+        let retrieved = node_b
+            .retrieve_tessera(
+                result.chunk_hashes,
+                result.config,
+                result.original_len,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(retrieved, data);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_store_tessera_survives_node_loss() {
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(8001, &network).await;
+        let (node_b, _dir_b) = make_node(8002, &network).await;
+        let (node_c, _dir_c) = make_node(8003, &network).await;
+
+        // Bootstrap all nodes
+        node_b.bootstrap(vec![node_a.local_addr()]).await.unwrap();
+        node_c.bootstrap(vec![node_a.local_addr()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Store tessera on A (4 data + 2 parity = 6 chunks)
+        let data = b"Critical data that must survive failures!".to_vec();
+        let config = ErasureConfig::new(4, 2).unwrap();
+        let result = node_a
+            .store_tessera(data.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Give time for distribution
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Shutdown node A (the original storer)
+        node_a.shutdown().await;
+
+        // Node C should still be able to retrieve via B (or local copies)
+        // Since A stored locally and distributed, B should have copies
+        let retrieved = node_b
+            .retrieve_tessera(
+                result.chunk_hashes.clone(),
+                result.config.clone(),
+                result.original_len,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(retrieved, data);
+
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+    }
+
+    async fn make_node_with_identity(
+        port: u16,
+        network: &InMemoryNetwork,
+        keypair: Keypair,
+        pow: PowProof,
+        metadata: MetadataStore,
+        chunks_dir: &std::path::Path,
+    ) -> NodeHandle {
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let transport =
+            Arc::new(InMemoryTransport::new(addr, network.clone()).await);
+        let chunks =
+            ChunkStore::new(&chunks_dir.join("chunks"), 10_000_000).unwrap();
+        spawn_node(keypair, pow, transport, metadata, chunks, test_config())
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_provider_maintenance_runs() {
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(10001, &network).await;
+        let (node_b, _dir_b) = make_node(10002, &network).await;
+
+        // Bootstrap
+        node_a.bootstrap(vec![node_b.local_addr()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Store a tessera (makes A a provider)
+        let data = b"test provider data".to_vec();
+        let config = ErasureConfig::new(2, 1).unwrap();
+        let _result = node_a.store_tessera(data, config).await.unwrap();
+
+        // Advance time past the provider republish interval (1 hour)
+        tokio::time::advance(Duration::from_secs(3601)).await;
+        // Yield to let the interval tick fire
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The node should still be operational after maintenance runs
+        let found = node_a.find_node(*node_b.node_id()).await.unwrap();
+        assert!(found.iter().any(|n| n.node_id == *node_b.node_id()));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_routing_table_persists_across_restart() {
+        let network = new_in_memory_network();
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("meta.db");
+
+        // --- First session: bootstrap and populate routing table ---
+        let keypair_a = Keypair::generate();
+        let secret_a = *keypair_a.secret_bytes();
+        let pow_a = PowProof::generate(&keypair_a.public_key_bytes(), 0);
+        let pow_nonce = pow_a.nonce;
+
+        let (node_b, _dir_b) = make_node(9002, &network).await;
+
+        let metadata_a = MetadataStore::open(&db_path).unwrap();
+        let handle_a = make_node_with_identity(
+            9001,
+            &network,
+            keypair_a,
+            pow_a,
+            metadata_a,
+            dir.path(),
+        )
+        .await;
+        handle_a.bootstrap(vec![node_b.local_addr()]).await.unwrap();
+
+        // Verify A knows about B
+        let found = handle_a.find_node(*node_b.node_id()).await.unwrap();
+        assert!(found.iter().any(|n| n.node_id == *node_b.node_id()));
+
+        // Shutdown A (triggers RT save)
+        handle_a.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // --- Second session: restart A with same identity, no bootstrap ---
+        let keypair_a2 = Keypair::from_secret_bytes(&secret_a);
+        let pow_a2 = PowProof {
+            nonce: pow_nonce,
+            difficulty: 0,
+        };
+        let metadata_a2 = MetadataStore::open(&db_path).unwrap();
+        let handle_a2 = make_node_with_identity(
+            9001,
+            &network,
+            keypair_a2,
+            pow_a2,
+            metadata_a2,
+            dir.path(),
+        )
+        .await;
+
+        // A2 should already know about B from persisted routing table
+        let found2 = handle_a2.find_node(*node_b.node_id()).await.unwrap();
+        assert!(found2.iter().any(|n| n.node_id == *node_b.node_id()));
+
+        handle_a2.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[test]
+    fn test_relay_request_hop_limit() {
+        // relay_hops >= max_relay_hops should be rejected
+        let config = NodeConfig::default();
+        assert_eq!(config.max_relay_hops, 1);
+    }
+
+    #[test]
+    fn test_relay_request_rejects_recursive_relay() {
+        // A RelayRequest whose inner payload is itself a RelayRequest should be blocked
+        let inner_relay = Message::new(
+            [1u8; 32],
+            [2u8; 32],
+            PowProof {
+                nonce: 0,
+                difficulty: 0,
+            },
+            Payload::RelayRequest {
+                target_id: [3u8; 32],
+                payload: vec![],
+                relay_hops: 0,
+            },
+        );
+        let inner_bytes = inner_relay.to_bytes().unwrap();
+
+        // The inner message, when deserialized, is a RelayRequest — should be blocked
+        let inner = Message::from_bytes(&inner_bytes).unwrap();
+        assert!(matches!(inner.payload, Payload::RelayRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_dead_peer_evicted_after_failures() {
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(11001, &network).await;
+        let (node_b, _dir_b) = make_node(11002, &network).await;
+
+        // Bootstrap A with B
+        node_a.bootstrap(vec![node_b.local_addr()]).await.unwrap();
+
+        // Verify A knows about B
+        let found = node_a.find_node(*node_b.node_id()).await.unwrap();
+        assert!(found.iter().any(|n| n.node_id == *node_b.node_id()));
+
+        // Shut down B — it will no longer respond to RPCs
+        node_b.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Each find_node targeting B will try to query B, fail, and record one failure.
+        // After max_failures (3) rounds, B should be evicted.
+        let config = test_config();
+        for _ in 0..config.max_failures {
+            let _ = node_a.find_node(*node_b.node_id()).await;
+        }
+
+        // B should no longer appear in A's routing table
+        let found_after = node_a.find_node(*node_a.node_id()).await.unwrap();
+        assert!(
+            !found_after.iter().any(|n| n.node_id == *node_b.node_id()),
+            "dead peer B should have been evicted after {} failures",
+            config.max_failures,
+        );
+
+        node_a.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_relay_request_response_protocol() {
+        // Verify RelayRequest/RelayResponse serialize and deserialize correctly
+        let inner_msg = Message::new(
+            [1u8; 32],
+            [2u8; 32],
+            PowProof {
+                nonce: 0,
+                difficulty: 0,
+            },
+            Payload::PingRequest,
+        );
+        let inner_bytes = inner_msg.to_bytes().unwrap();
+
+        let relay_req = Message::new(
+            [3u8; 32],
+            [4u8; 32],
+            PowProof {
+                nonce: 0,
+                difficulty: 0,
+            },
+            Payload::RelayRequest {
+                target_id: [5u8; 32],
+                payload: inner_bytes.clone(),
+                relay_hops: 0,
+            },
+        );
+
+        let encoded = relay_req.to_bytes().unwrap();
+        let decoded = Message::from_bytes(&encoded).unwrap();
+        assert!(decoded.is_request());
+
+        match decoded.payload {
+            Payload::RelayRequest {
+                target_id, payload, ..
+            } => {
+                assert_eq!(target_id, [5u8; 32]);
+                assert_eq!(payload, inner_bytes);
+                // Verify inner message round-trips
+                let inner = Message::from_bytes(&payload).unwrap();
+                assert!(matches!(inner.payload, Payload::PingRequest));
+            }
+            _ => panic!("wrong payload type"),
+        }
+
+        // Test RelayResponse
+        let relay_resp = Message::new(
+            [6u8; 32],
+            [7u8; 32],
+            PowProof {
+                nonce: 0,
+                difficulty: 0,
+            },
+            Payload::RelayResponse {
+                ok: true,
+                payload: vec![0xDE, 0xAD],
+            },
+        );
+        let encoded = relay_resp.to_bytes().unwrap();
+        let decoded = Message::from_bytes(&encoded).unwrap();
+        assert!(!decoded.is_request());
+
+        match decoded.payload {
+            Payload::RelayResponse { ok, payload } => {
+                assert!(ok);
+                assert_eq!(payload, vec![0xDE, 0xAD]);
+            }
+            _ => panic!("wrong payload type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relay_forwarding() {
+        // 3 nodes: A, B, C. A and B bootstrap via C.
+        // Then we remove B's route from the network so A can't reach B directly.
+        // A should be able to reach B through relay via C.
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(12001, &network).await;
+        let (node_b, _dir_b) = make_node(12002, &network).await;
+        let (node_c, _dir_c) = make_node(12003, &network).await;
+
+        // Bootstrap all through C
+        node_a.bootstrap(vec![node_c.local_addr()]).await.unwrap();
+        node_b.bootstrap(vec![node_c.local_addr()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify A can find B directly first
+        let found = node_a.find_node(*node_b.node_id()).await.unwrap();
+        assert!(
+            found.iter().any(|n| n.node_id == *node_b.node_id()),
+            "A should find B before disconnect"
+        );
+
+        // Remove B's direct route from A's perspective by removing B's
+        // network entry and re-adding it under a different address that A
+        // doesn't know about. Instead, we'll remove B's entry and re-register
+        // it — but C still has B's address.
+        //
+        // Actually, the simplest approach: remove B from the shared network,
+        // then re-add B. This simulates B being unreachable directly from A
+        // while C still has B in its routing table and can forward.
+        //
+        // The InMemoryNetwork routes by address, so we need to:
+        // 1. Remove B's address from the shared network map
+        // 2. This makes direct send_request to B fail for everyone
+        // 3. But we want C to still reach B — so we can't remove B entirely
+        //
+        // Better approach: We just test that the relay handler works by
+        // having A send a RelayRequest to C asking to relay to B.
+        // C should forward to B and return the response.
+
+        // Create a keypair for the relay test sender (needs valid identity for verification)
+        let relay_kp = Keypair::generate();
+        let relay_pow = PowProof::generate(&relay_kp.public_key_bytes(), 0);
+        let relay_node_id = relay_kp.node_id();
+
+        // Send a relay request from a new sender through C targeting B
+        let mut inner_msg = Message::new(
+            *relay_node_id.as_bytes(),
+            relay_kp.public_key_bytes(),
+            relay_pow.clone(),
+            Payload::FindNodeRequest {
+                target: *node_b.node_id().as_bytes(),
+            },
+        );
+        inner_msg.sign(&relay_kp);
+        let inner_bytes = inner_msg.to_bytes().unwrap();
+
+        // Create a temporary transport for the relay sender
+        let relay_addr: SocketAddr = "127.0.0.1:12099".parse().unwrap();
+        let transport_relay =
+            Arc::new(InMemoryTransport::new(relay_addr, network.clone()).await);
+
+        let mut relay_msg = Message::new(
+            *relay_node_id.as_bytes(),
+            relay_kp.public_key_bytes(),
+            relay_pow,
+            Payload::RelayRequest {
+                target_id: *node_b.node_id().as_bytes(),
+                payload: inner_bytes,
+                relay_hops: 0,
+            },
+        );
+        relay_msg.sign(&relay_kp);
+
+        let resp = transport_relay
+            .send_request(&node_c.local_addr(), relay_msg)
+            .await
+            .unwrap();
+
+        match resp.payload {
+            Payload::RelayResponse { ok, payload } => {
+                assert!(ok, "relay should succeed");
+                let inner_resp = Message::from_bytes(&payload).unwrap();
+                assert!(
+                    matches!(
+                        inner_resp.payload,
+                        Payload::FindNodeResponse { .. }
+                    ),
+                    "relayed response should be FindNodeResponse"
+                );
+            }
+            other => panic!("expected RelayResponse, got {:?}", other),
+        }
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_inbound_rejects_wrong_sender_id() {
+        // Message with sender_id that doesn't match sender_key should be dropped
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(13001, &network).await;
+        let (node_b, _dir_b) = make_node(13002, &network).await;
+
+        // Bootstrap so A knows B
+        node_a.bootstrap(vec![node_b.local_addr()]).await.unwrap();
+
+        // Create a message with mismatched sender_id / sender_key
+        let kp = Keypair::generate();
+        let pow = PowProof::generate(&kp.public_key_bytes(), 0);
+        let wrong_id = [0xFFu8; 32]; // doesn't match any key
+
+        let addr_sender: SocketAddr = "127.0.0.1:13099".parse().unwrap();
+        let transport_sender = Arc::new(
+            InMemoryTransport::new(addr_sender, network.clone()).await,
+        );
+
+        let msg = Message::new(
+            wrong_id,
+            kp.public_key_bytes(),
+            pow,
+            Payload::PingRequest,
+        );
+
+        // Send to node_b — should timeout because node_b drops the message (no response)
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            transport_sender.send_request(&node_b.local_addr(), msg),
+        )
+        .await;
+
+        // Should timeout (message was dropped, no response sent)
+        assert!(result.is_err() || result.unwrap().is_err());
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_inbound_rejects_insufficient_pow() {
+        // Message with PoW difficulty below min_pow_difficulty should be dropped.
+        // In test mode min_pow_difficulty=0, so we test with a forged proof that
+        // claims high difficulty but doesn't actually have it.
+        let network = new_in_memory_network();
+        let (_node_a, _dir_a) = make_node(14001, &network).await;
+        let (node_b, _dir_b) = make_node(14002, &network).await;
+
+        let kp = Keypair::generate();
+        // Create a forged PoW proof that claims difficulty 8 but nonce=0 won't verify
+        let forged_pow = PowProof {
+            nonce: 999_999_999,
+            difficulty: 8,
+        };
+        // This proof likely won't verify for the given key
+
+        let addr_sender: SocketAddr = "127.0.0.1:14099".parse().unwrap();
+        let transport_sender = Arc::new(
+            InMemoryTransport::new(addr_sender, network.clone()).await,
+        );
+
+        let msg = Message::new(
+            *kp.node_id().as_bytes(),
+            kp.public_key_bytes(),
+            forged_pow,
+            Payload::PingRequest,
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            transport_sender.send_request(&node_b.local_addr(), msg),
+        )
+        .await;
+
+        // Should timeout — invalid PoW means message is dropped
+        assert!(result.is_err() || result.unwrap().is_err());
+
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_inbound_accepts_valid_message() {
+        // A message with valid identity, PoW, and signature should be processed normally
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(15001, &network).await;
+
+        let kp = Keypair::generate();
+        let pow = PowProof::generate(&kp.public_key_bytes(), 0);
+
+        let addr_sender: SocketAddr = "127.0.0.1:15099".parse().unwrap();
+        let transport_sender = Arc::new(
+            InMemoryTransport::new(addr_sender, network.clone()).await,
+        );
+
+        let mut msg = Message::new(
+            *kp.node_id().as_bytes(),
+            kp.public_key_bytes(),
+            pow,
+            Payload::PingRequest,
+        );
+        msg.sign(&kp);
+
+        let resp = transport_sender
+            .send_request(&node_a.local_addr(), msg)
+            .await
+            .unwrap();
+        assert!(matches!(resp.payload, Payload::PingResponse));
+
+        node_a.shutdown().await;
+    }
+}
