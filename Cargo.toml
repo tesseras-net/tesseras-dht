@@ -1,6 +1,6 @@
 [package]
 name = "tesseras-dht"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 authors = ["Murilo Ijanc <murilo@ijanc.org>"]
 categories = ["network-programming"]
 edition = "2024"
