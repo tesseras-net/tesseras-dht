@@ -12,7 +12,7 @@ use crate::error::TesseraError;
 ///
 /// Fields are private to enforce validation. Use [`ErasureConfig::new()`] or
 /// [`ErasureConfig::default()`] to construct.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ErasureConfig {
     data_shards: usize,
     parity_shards: usize,

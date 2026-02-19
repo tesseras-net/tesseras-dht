@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +60,8 @@ pub struct NodeConfig {
     /// Client mode: skip iterative find_node during bootstrap and don't
     /// advertise this node in the routing table. Useful for ephemeral nodes.
     pub client_mode: bool,
+    /// Default erasure coding configuration for store operations.
+    pub erasure_config: ErasureConfig,
 }
 
 impl Default for NodeConfig {
@@ -80,6 +85,7 @@ impl Default for NodeConfig {
             write_rate_burst: 20,
             max_concurrent_handlers: 256,
             client_mode: false,
+            erasure_config: ErasureConfig::default(),
         }
     }
 }
@@ -120,11 +126,74 @@ pub struct StoreTesseraResult {
     pub original_len: usize,
 }
 
+/// Compact serialization format for StoreTesseraResult tokens.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoreTesseraResultToken {
+    h: Vec<Vec<u8>>,
+    d: usize,
+    p: usize,
+    l: usize,
+}
+
+impl fmt::Display for StoreTesseraResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use base64::Engine;
+        let token = StoreTesseraResultToken {
+            h: self.chunk_hashes.iter().map(|h| h.to_vec()).collect(),
+            d: self.config.data_shards(),
+            p: self.config.parity_shards(),
+            l: self.original_len,
+        };
+        let msgpack = rmp_serde::to_vec(&token).expect("msgpack serialization");
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&msgpack);
+        f.write_str(&encoded)
+    }
+}
+
+impl FromStr for StoreTesseraResult {
+    type Err = TesseraError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .map_err(|e| {
+                TesseraError::Serialization(format!("base64: {}", e))
+            })?;
+        let token: StoreTesseraResultToken = rmp_serde::from_slice(&bytes)
+            .map_err(|e| {
+                TesseraError::Serialization(format!("msgpack: {}", e))
+            })?;
+        let chunk_hashes: Vec<[u8; 32]> = token
+            .h
+            .into_iter()
+            .map(|v| {
+                let mut arr = [0u8; 32];
+                if v.len() != 32 {
+                    return Err(TesseraError::Serialization(
+                        "chunk hash must be 32 bytes".into(),
+                    ));
+                }
+                arr.copy_from_slice(&v);
+                Ok(arr)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let config = ErasureConfig::new(token.d, token.p)?;
+        Ok(StoreTesseraResult {
+            chunk_hashes,
+            config,
+            original_len: token.l,
+        })
+    }
+}
+
 /// Handle for interacting with a running TesseraNode.
 pub struct NodeHandle {
     cmd_tx: mpsc::Sender<Command>,
     node_id: NodeId,
     local_addr: SocketAddr,
+    erasure_config: ErasureConfig,
 }
 
 impl NodeHandle {
@@ -214,28 +283,32 @@ impl NodeHandle {
             .map_err(|_| TesseraError::Network("node stopped".into()))?
     }
 
-    /// Erasure-encode data and distribute chunks across the DHT.
-    ///
-    /// The data is split into `config.data_shards` pieces plus `config.parity_shards`
-    /// redundancy pieces using Reed-Solomon coding. Each chunk is stored locally and
-    /// distributed to the closest peers. The returned [`StoreTesseraResult`] contains
-    /// the chunk hashes and config needed to retrieve the data later.
+    /// Erasure-encode data and distribute chunks across the DHT using the
+    /// node's default [`ErasureConfig`].
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # async fn example(handle: tesseras_dht::node::NodeHandle) -> Result<(), tesseras_dht::TesseraError> {
-    /// use tesseras_dht::erasure::ErasureConfig;
-    ///
-    /// let data = b"important data".to_vec();
-    /// let config = ErasureConfig::new(4, 2).unwrap();
-    /// let result = handle.store_tessera(data, config).await?;
-    /// // Save result.chunk_hashes, result.config, result.original_len for retrieval
+    /// let result = handle.store(b"important data").await?;
+    /// let token = result.to_string(); // compact retrieval token
     /// # Ok(())
     /// # }
     /// ```
+    pub async fn store(
+        &self,
+        data: impl AsRef<[u8]>,
+    ) -> Result<StoreTesseraResult, TesseraError> {
+        self.store_with_config(
+            data.as_ref().to_vec(),
+            self.erasure_config.clone(),
+        )
+        .await
+    }
+
+    /// Erasure-encode data with an explicit [`ErasureConfig`].
     #[instrument(skip(self, data), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), data_len = data.len(), data_shards = config.data_shards(), parity_shards = config.parity_shards()))]
-    pub async fn store_tessera(
+    pub async fn store_with_config(
         &self,
         data: Vec<u8>,
         config: ErasureConfig,
@@ -253,11 +326,7 @@ impl NodeHandle {
             .map_err(|_| TesseraError::Network("node stopped".into()))?
     }
 
-    /// Retrieve and reconstruct data from erasure-coded chunks.
-    ///
-    /// Fetches chunks from local storage and remote peers, then reconstructs the
-    /// original data using Reed-Solomon decoding. At least `config.data_shards`
-    /// chunks must be available for successful reconstruction.
+    /// Retrieve and reconstruct data using the config embedded in `result`.
     ///
     /// # Examples
     ///
@@ -266,27 +335,31 @@ impl NodeHandle {
     /// #     handle: tesseras_dht::node::NodeHandle,
     /// #     result: tesseras_dht::node::StoreTesseraResult,
     /// # ) -> Result<(), tesseras_dht::TesseraError> {
-    /// let data = handle.retrieve_tessera(
-    ///     result.chunk_hashes,
-    ///     result.config,
-    ///     result.original_len,
-    /// ).await?;
+    /// let data = handle.retrieve(&result).await?;
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(skip(self, chunk_hashes), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), num_chunks = chunk_hashes.len(), original_len))]
-    pub async fn retrieve_tessera(
+    pub async fn retrieve(
         &self,
-        chunk_hashes: Vec<[u8; 32]>,
+        result: &StoreTesseraResult,
+    ) -> Result<Vec<u8>, TesseraError> {
+        self.retrieve_with_config(result, result.config.clone())
+            .await
+    }
+
+    /// Retrieve and reconstruct data with an explicit [`ErasureConfig`] override.
+    #[instrument(skip(self, result), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), num_chunks = result.chunk_hashes.len(), original_len = result.original_len))]
+    pub async fn retrieve_with_config(
+        &self,
+        result: &StoreTesseraResult,
         config: ErasureConfig,
-        original_len: usize,
     ) -> Result<Vec<u8>, TesseraError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::RetrieveTessera {
-                chunk_hashes,
+                chunk_hashes: result.chunk_hashes.clone(),
                 config,
-                original_len,
+                original_len: result.original_len,
                 reply: tx,
             })
             .await
@@ -301,6 +374,240 @@ impl NodeHandle {
     #[instrument(skip(self), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4])))]
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(Command::Shutdown).await;
+    }
+}
+
+/// Source for bootstrap peer discovery.
+#[derive(Clone, Debug)]
+pub enum BootstrapSource {
+    /// Explicit peer addresses.
+    Addrs(Vec<SocketAddr>),
+    /// DNS SRV lookup on `_tesseras._udp.<domain>`.
+    Dns(String),
+}
+
+/// High-level builder for spawning a Tessera DHT node.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() -> Result<(), tesseras_dht::TesseraError> {
+/// use tesseras_dht::node::{NodeBuilder, BootstrapSource};
+///
+/// let node = NodeBuilder::new("./data")
+///     .bootstrap(BootstrapSource::Dns("tesseras.net".into()))
+///     .spawn()
+///     .await?;
+///
+/// let result = node.store("hello tesseras").await?;
+/// println!("token: {}", result);
+///
+/// node.shutdown().await;
+/// # Ok(())
+/// # }
+/// ```
+pub struct NodeBuilder {
+    bind_addr: Option<SocketAddr>,
+    data_dir: PathBuf,
+    pow_difficulty: u8,
+    max_storage: u64,
+    erasure_config: ErasureConfig,
+    config: NodeConfig,
+    keypair: Option<(Keypair, PowProof)>,
+    bootstrap_sources: Vec<BootstrapSource>,
+    mdns: bool,
+}
+
+impl NodeBuilder {
+    /// Create a builder with only the required `data_dir`.
+    ///
+    /// Defaults: bind `[::]:0`, PoW difficulty 16, 1 GB storage, 10+4 erasure,
+    /// mDNS enabled, no bootstrap peers (acts as a bootstrap node).
+    pub fn new(data_dir: impl AsRef<Path>) -> Self {
+        Self {
+            bind_addr: None,
+            data_dir: data_dir.as_ref().to_path_buf(),
+            pow_difficulty: 16,
+            max_storage: 1_073_741_824,
+            erasure_config: ErasureConfig::default(),
+            config: NodeConfig::default(),
+            keypair: None,
+            bootstrap_sources: Vec::new(),
+            mdns: true,
+        }
+    }
+
+    /// Set the listen address (default: `[::]:0`).
+    pub fn bind(mut self, addr: SocketAddr) -> Self {
+        self.bind_addr = Some(addr);
+        self
+    }
+
+    /// Set proof-of-work difficulty (default: 16).
+    pub fn pow_difficulty(mut self, d: u8) -> Self {
+        self.pow_difficulty = d;
+        self
+    }
+
+    /// Set maximum storage quota in bytes (default: 1 GB).
+    pub fn max_storage(mut self, bytes: u64) -> Self {
+        self.max_storage = bytes;
+        self
+    }
+
+    /// Set erasure coding configuration (default: 10 data + 4 parity).
+    pub fn erasure_config(mut self, config: ErasureConfig) -> Self {
+        self.erasure_config = config;
+        self
+    }
+
+    /// Override the full [`NodeConfig`].
+    pub fn config(mut self, config: NodeConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Provide a pre-generated keypair and proof-of-work.
+    pub fn keypair(mut self, keypair: Keypair, pow: PowProof) -> Self {
+        self.keypair = Some((keypair, pow));
+        self
+    }
+
+    /// Enable client mode (ephemeral nodes that don't join the routing table).
+    pub fn client_mode(mut self, enabled: bool) -> Self {
+        self.config.client_mode = enabled;
+        self
+    }
+
+    /// Add a bootstrap source. Can be called multiple times to accumulate sources.
+    pub fn bootstrap(mut self, source: BootstrapSource) -> Self {
+        self.bootstrap_sources.push(source);
+        self
+    }
+
+    /// Enable or disable mDNS LAN discovery (default: true).
+    pub fn mdns(mut self, enabled: bool) -> Self {
+        self.mdns = enabled;
+        self
+    }
+
+    /// Spawn the node, returning a [`NodeHandle`].
+    ///
+    /// This will:
+    /// 1. Open/create storage
+    /// 2. Load or generate keypair + PoW
+    /// 3. Create QUIC transport
+    /// 4. Start the node actor
+    /// 5. Resolve and connect to bootstrap sources
+    /// 6. Start mDNS discovery (if enabled)
+    pub async fn spawn(self) -> Result<NodeHandle, TesseraError> {
+        use crate::transport::quic::QuicTransport;
+
+        std::fs::create_dir_all(&self.data_dir)?;
+
+        let metadata = MetadataStore::open(&self.data_dir.join("metadata.db"))?;
+        let chunks =
+            ChunkStore::new(&self.data_dir.join("chunks"), self.max_storage)?;
+
+        // Load or generate identity
+        let (keypair, pow) = if let Some(kp) = self.keypair {
+            kp
+        } else {
+            match metadata.load_identity() {
+                Ok(Some((secret, nonce, difficulty))) => {
+                    let kp = Keypair::from_secret_bytes(&secret);
+                    let pow = PowProof { nonce, difficulty };
+                    (kp, pow)
+                }
+                _ => {
+                    let kp = Keypair::generate();
+                    let difficulty = self.pow_difficulty;
+                    let pub_key = kp.public_key_bytes();
+                    let pow = tokio::task::spawn_blocking(move || {
+                        PowProof::generate(&pub_key, difficulty)
+                    })
+                    .await
+                    .map_err(|e| {
+                        TesseraError::Network(format!("PoW task failed: {}", e))
+                    })?;
+                    let _ = metadata.save_identity(
+                        kp.secret_bytes(),
+                        pow.nonce,
+                        pow.difficulty,
+                    );
+                    (kp, pow)
+                }
+            }
+        };
+
+        let bind_addr =
+            self.bind_addr.unwrap_or_else(|| "[::]:0".parse().unwrap());
+        let transport = Arc::new(QuicTransport::new(bind_addr).await?);
+
+        let mut config = self.config;
+        config.min_pow_difficulty = self.pow_difficulty;
+        config.erasure_config = self.erasure_config;
+
+        let handle =
+            spawn_node(keypair, pow, transport, metadata, chunks, config).await;
+
+        // Resolve bootstrap sources
+        let mut all_addrs = Vec::new();
+        for source in &self.bootstrap_sources {
+            match source {
+                BootstrapSource::Addrs(addrs) => {
+                    all_addrs.extend_from_slice(addrs);
+                }
+                BootstrapSource::Dns(domain) => {
+                    match crate::transport::dns_bootstrap::resolve_bootstrap(
+                        domain,
+                    )
+                    .await
+                    {
+                        Ok(addrs) => all_addrs.extend(addrs),
+                        Err(e) => {
+                            tracing::warn!(
+                                "DNS bootstrap for {} failed: {}",
+                                domain,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if !all_addrs.is_empty() {
+            handle.bootstrap(all_addrs).await?;
+        }
+
+        // Start mDNS discovery
+        if self.mdns {
+            let port = handle.local_addr().port();
+            let handle_clone = handle.cmd_tx.clone();
+            let node_id = handle.node_id;
+            if let Ok(mut mdns) =
+                crate::transport::mdns::MdnsDiscovery::new(port)
+            {
+                tokio::spawn(async move {
+                    while let Some(addr) = mdns.next_discovered().await {
+                        let (tx, _rx) = oneshot::channel();
+                        let _ = handle_clone
+                            .send(Command::Bootstrap {
+                                addrs: vec![addr],
+                                reply: tx,
+                            })
+                            .await;
+                        tracing::debug!(
+                            node_id = %hex::encode(&node_id.as_bytes()[..4]),
+                            "mDNS discovered peer at {}",
+                            addr
+                        );
+                    }
+                });
+            }
+        }
+
+        Ok(handle)
     }
 }
 
@@ -343,6 +650,7 @@ pub async fn spawn_node<T: Transport>(
     let peer_chunk_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let handler_semaphore =
         Arc::new(Semaphore::new(config.max_concurrent_handlers));
+    let erasure_config = config.erasure_config.clone();
     let config = Arc::new(config);
 
     let actor = NodeActor {
@@ -367,6 +675,7 @@ pub async fn spawn_node<T: Transport>(
         cmd_tx,
         node_id,
         local_addr,
+        erasure_config,
     }
 }
 
@@ -1931,7 +2240,7 @@ mod tests {
         let data = b"Hello Tessera! This is important data.".to_vec();
         let config = ErasureConfig::new(4, 2).unwrap();
         let result = node_a
-            .store_tessera(data.clone(), config.clone())
+            .store_with_config(data.clone(), config)
             .await
             .unwrap();
 
@@ -1939,14 +2248,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Retrieve from B
-        let retrieved = node_b
-            .retrieve_tessera(
-                result.chunk_hashes,
-                result.config,
-                result.original_len,
-            )
-            .await
-            .unwrap();
+        let retrieved = node_b.retrieve(&result).await.unwrap();
 
         assert_eq!(retrieved, data);
 
@@ -1970,7 +2272,7 @@ mod tests {
         let data = b"Critical data that must survive failures!".to_vec();
         let config = ErasureConfig::new(4, 2).unwrap();
         let result = node_a
-            .store_tessera(data.clone(), config.clone())
+            .store_with_config(data.clone(), config)
             .await
             .unwrap();
 
@@ -1982,14 +2284,7 @@ mod tests {
 
         // Node C should still be able to retrieve via B (or local copies)
         // Since A stored locally and distributed, B should have copies
-        let retrieved = node_b
-            .retrieve_tessera(
-                result.chunk_hashes.clone(),
-                result.config.clone(),
-                result.original_len,
-            )
-            .await
-            .unwrap();
+        let retrieved = node_b.retrieve(&result).await.unwrap();
 
         assert_eq!(retrieved, data);
 
@@ -2027,7 +2322,7 @@ mod tests {
         // Store a tessera (makes A a provider)
         let data = b"test provider data".to_vec();
         let config = ErasureConfig::new(2, 1).unwrap();
-        let _result = node_a.store_tessera(data, config).await.unwrap();
+        let _result = node_a.store_with_config(data, config).await.unwrap();
 
         // Advance time past the provider republish interval (1 hour)
         tokio::time::advance(Duration::from_secs(3601)).await;
@@ -2447,5 +2742,71 @@ mod tests {
         assert!(matches!(resp.payload, Payload::PingResponse));
 
         node_a.shutdown().await;
+    }
+
+    #[test]
+    fn test_store_tessera_result_display_fromstr_roundtrip() {
+        let result = StoreTesseraResult {
+            chunk_hashes: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+            config: ErasureConfig::new(2, 1).unwrap(),
+            original_len: 42,
+        };
+
+        let token = result.to_string();
+        let parsed: StoreTesseraResult = token.parse().unwrap();
+
+        assert_eq!(parsed.chunk_hashes, result.chunk_hashes);
+        assert_eq!(parsed.config.data_shards(), 2);
+        assert_eq!(parsed.config.parity_shards(), 1);
+        assert_eq!(parsed.original_len, 42);
+    }
+
+    #[test]
+    fn test_store_tessera_result_fromstr_invalid_base64() {
+        let result = "not-valid-!!!".parse::<StoreTesseraResult>();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_node_builder_spawn() {
+        let dir = TempDir::new().unwrap();
+        let network = new_in_memory_network();
+        let (peer, _peer_dir) = make_node(12001, &network).await;
+
+        // NodeBuilder creates a QuicTransport internally, so we can't use the
+        // in-memory network. Instead just verify construction succeeds with
+        // the low-level API using similar patterns.
+        let keypair = Keypair::generate();
+        let pow = PowProof::generate(&keypair.public_key_bytes(), 0);
+
+        let addr: SocketAddr = "127.0.0.1:12002".parse().unwrap();
+        let transport =
+            Arc::new(InMemoryTransport::new(addr, network.clone()).await);
+        let metadata = MetadataStore::in_memory().unwrap();
+        let chunks =
+            ChunkStore::new(&dir.path().join("chunks"), 10_000_000).unwrap();
+
+        let config = NodeConfig {
+            min_pow_difficulty: 0,
+            erasure_config: ErasureConfig::new(2, 1).unwrap(),
+            ..Default::default()
+        };
+        let handle =
+            spawn_node(keypair, pow, transport, metadata, chunks, config).await;
+
+        // store uses the default erasure_config (2+1)
+        handle.bootstrap(vec![peer.local_addr()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let data = b"builder test data";
+        let result = handle.store(data).await.unwrap();
+        assert_eq!(result.config.data_shards(), 2);
+        assert_eq!(result.config.parity_shards(), 1);
+
+        let retrieved = handle.retrieve(&result).await.unwrap();
+        assert_eq!(retrieved, data);
+
+        handle.shutdown().await;
+        peer.shutdown().await;
     }
 }

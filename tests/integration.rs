@@ -57,20 +57,13 @@ async fn test_full_lifecycle() {
     let data: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
     let config = ErasureConfig::new(4, 2).unwrap();
     let result = n1
-        .store_tessera(data.clone(), config.clone())
+        .store_with_config(data.clone(), config.clone())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // 4. Node 5 retrieves it
-    let retrieved = n5
-        .retrieve_tessera(
-            result.chunk_hashes.clone(),
-            result.config.clone(),
-            result.original_len,
-        )
-        .await
-        .unwrap();
+    let retrieved = n5.retrieve(&result).await.unwrap();
     assert_eq!(retrieved, data);
 
     // 5. Shutdown nodes 2 and 3
@@ -79,14 +72,7 @@ async fn test_full_lifecycle() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 6. Node 4 still retrieves it (erasure coding + local copies on remaining nodes)
-    let retrieved2 = n4
-        .retrieve_tessera(
-            result.chunk_hashes.clone(),
-            result.config.clone(),
-            result.original_len,
-        )
-        .await
-        .unwrap();
+    let retrieved2 = n4.retrieve(&result).await.unwrap();
     assert_eq!(retrieved2, data);
 
     n1.shutdown().await;
@@ -112,32 +98,18 @@ async fn test_multiple_tesseras() {
     let data2 = b"Second tessera with different content".to_vec();
 
     let result1 = n1
-        .store_tessera(data1.clone(), config.clone())
+        .store_with_config(data1.clone(), config.clone())
         .await
         .unwrap();
     let result2 = n2
-        .store_tessera(data2.clone(), config.clone())
+        .store_with_config(data2.clone(), config.clone())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Retrieve from different nodes
-    let r1 = n3
-        .retrieve_tessera(
-            result1.chunk_hashes,
-            result1.config,
-            result1.original_len,
-        )
-        .await
-        .unwrap();
-    let r2 = n3
-        .retrieve_tessera(
-            result2.chunk_hashes,
-            result2.config,
-            result2.original_len,
-        )
-        .await
-        .unwrap();
+    let r1 = n3.retrieve(&result1).await.unwrap();
+    let r2 = n3.retrieve(&result2).await.unwrap();
 
     assert_eq!(r1, data1);
     assert_eq!(r2, data2);

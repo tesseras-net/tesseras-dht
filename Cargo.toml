@@ -1,10 +1,17 @@
 [package]
 name = "tesseras-dht"
 version = "0.1.0"
+authors = ["Murilo Ijanc <murilo@ijanc.org>"]
+categories = ["network-programming"]
 edition = "2024"
+homepage = "https://tesseras.net"
+keywords = ["dht", "kademlia", "p2p", "quic", "distributed"]
+license = "ISC"
+repository = "https://git.sr.ht/~ijanc/tesseras-dht"
 description = "Kademlia DHT with integrated chunk storage for the Tesseras P2P network"
 
 [dependencies]
+base64 = "0.22"
 clap = { version = "4", features = ["derive"], optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core", "std"] }
 gethostname = "1"

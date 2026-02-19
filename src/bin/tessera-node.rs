@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tesseras_dht::identity::{Keypair, PowProof};
-use tesseras_dht::node::{NodeConfig, spawn_node};
+use tesseras_dht::node::{NodeConfig, StoreTesseraResult, spawn_node};
 use tesseras_dht::storage::{ChunkStore, MetadataStore};
 use tesseras_dht::transport::Transport;
 use tesseras_dht::transport::quic::QuicTransport;
@@ -273,7 +273,7 @@ async fn cmd_store(
         "Storing tessera ({} data + {} parity shards)...",
         data_shards, parity_shards
     );
-    match handle.store_tessera(data, config).await {
+    match handle.store_with_config(data, config).await {
         Ok(result) => {
             println!("Stored successfully. Retrieval metadata:");
             println!();
@@ -347,10 +347,12 @@ async fn cmd_get(
     }
 
     println!("Retrieving tessera ({} chunks)...", chunk_hashes.len());
-    match handle
-        .retrieve_tessera(chunk_hashes, config, original_len)
-        .await
-    {
+    let result = StoreTesseraResult {
+        chunk_hashes,
+        config,
+        original_len,
+    };
+    match handle.retrieve(&result).await {
         Ok(data) => {
             std::fs::write(&output_path, &data)
                 .expect("failed to write output file");

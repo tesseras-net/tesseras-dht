@@ -5,7 +5,7 @@ use hickory_resolver::TokioResolver;
 use crate::error::TesseraError;
 
 /// Resolve bootstrap nodes via DNS SRV records.
-/// Looks up `_tessera._udp.<domain>` and returns addresses sorted by SRV priority.
+/// Looks up `_tesseras._udp.<domain>` and returns addresses sorted by SRV priority.
 pub async fn resolve_bootstrap(
     domain: &str,
 ) -> Result<Vec<SocketAddr>, TesseraError> {
@@ -13,7 +13,7 @@ pub async fn resolve_bootstrap(
         .map_err(|e| TesseraError::Network(format!("resolver init: {}", e)))?
         .build();
 
-    let srv_name = format!("_tessera._udp.{}", domain);
+    let srv_name = format!("_tesseras._udp.{}", domain);
 
     let srv_lookup = resolver.srv_lookup(&srv_name).await.map_err(|e| {
         TesseraError::Network(format!("DNS SRV lookup failed: {}", e))
@@ -53,7 +53,7 @@ mod tests {
     #[test]
     fn test_srv_name_format() {
         let domain = "example.com";
-        let srv_name = format!("_tessera._udp.{}", domain);
-        assert_eq!(srv_name, "_tessera._udp.example.com");
+        let srv_name = format!("_tesseras._udp.{}", domain);
+        assert_eq!(srv_name, "_tesseras._udp.example.com");
     }
 }

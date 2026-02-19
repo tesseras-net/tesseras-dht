@@ -12,6 +12,8 @@
 //!   cargo build                  # library only
 //!   ```
 
+pub mod prelude;
+
 pub mod erasure;
 pub mod identity;
 pub mod lookup;

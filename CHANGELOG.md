@@ -9,4 +9,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Features
 
 - Initial release — Kademlia DHT with chunk storage for the Tesseras P2P network
-

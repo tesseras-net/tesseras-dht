@@ -1,9 +1,14 @@
 {
   "markdown": {
+    "textWrap": "always"
   },
   "toml": {
   },
   "excludes": [
+    "cliff.toml",
+    "deny.toml",
+    "rust-toolchain.toml",
+    "CHANGELOG.md",
     "deny.toml",
     "docs",
     "cliff.toml"
