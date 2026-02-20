@@ -24,7 +24,7 @@ rand = "0.9"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 reed-solomon-erasure = { version = "6", default-features = false, features = ["std"] }
 rmp-serde = "1"
-rusqlite = "0.32"
+rusqlite = { version = "0.32", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -63,3 +63,4 @@ required-features = ["cli"]
 # Build with: cargo build --features cli
 cli = ["clap", "tracing-subscriber", "tempfile", "tokio/signal", "tokio/fs", "tokio/io-std"]
 prometheus = ["metrics-exporter-prometheus"]
+sqlite-bundled = ["rusqlite/bundled"]
