@@ -67,6 +67,26 @@ impl RoutingTable {
         self.buckets[bucket_idx].record_failure(node_id, max_failures);
     }
 
+    /// Record a failure for a node identified by socket address.
+    /// Used when we don't know the NodeId (e.g. bootstrap ping failures).
+    pub fn record_failure_by_addr(
+        &mut self,
+        addr: &std::net::SocketAddr,
+        max_failures: u8,
+    ) {
+        for bucket in &mut self.buckets {
+            if let Some(node_id) = bucket
+                .nodes()
+                .iter()
+                .find(|n| n.addresses.contains(addr))
+                .map(|n| n.node_id)
+            {
+                bucket.record_failure(&node_id, max_failures);
+                return;
+            }
+        }
+    }
+
     /// Mark a node as seen (update last_seen, reset fail_count).
     pub fn mark_seen(&mut self, node_id: &NodeId) {
         let bucket_idx = self.bucket_index(node_id);
@@ -325,5 +345,36 @@ mod tests {
         // With zero threshold — everything non-empty is stale
         let stale = rt.stale_bucket_indices(Duration::ZERO);
         assert!(stale.contains(&0));
+    }
+
+    #[test]
+    fn test_record_failure_by_addr() {
+        let local_id = NodeId::from_bytes([0u8; 32]);
+        let mut rt = RoutingTable::new(local_id, 20);
+
+        let addr: std::net::SocketAddr = "192.168.0.130:58717".parse().unwrap();
+        let mut id_bytes = [0u8; 32];
+        id_bytes[0] = 0x80;
+        let node =
+            NodeInfo::new(NodeId::from_bytes(id_bytes), [0u8; 32], vec![addr]);
+        rt.insert(node);
+        assert_eq!(rt.len(), 1);
+
+        // Record failures by address — should evict after max_failures
+        rt.record_failure_by_addr(&addr, 2);
+        assert_eq!(rt.len(), 1); // still there after 1 failure
+        rt.record_failure_by_addr(&addr, 2);
+        assert_eq!(rt.len(), 0); // evicted after 2 failures
+    }
+
+    #[test]
+    fn test_record_failure_by_addr_unknown() {
+        let local_id = NodeId::from_bytes([0u8; 32]);
+        let mut rt = RoutingTable::new(local_id, 20);
+
+        // Should not panic on unknown address
+        let addr: std::net::SocketAddr = "10.0.0.1:1234".parse().unwrap();
+        rt.record_failure_by_addr(&addr, 3);
+        assert_eq!(rt.len(), 0);
     }
 }

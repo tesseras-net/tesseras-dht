@@ -142,3 +142,32 @@ async fn test_node_discovery_transitivity() {
     n2.shutdown().await;
     n3.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_proactive_replication_on_new_node() {
+    let network = new_in_memory_network();
+
+    // Node 1 stores data alone
+    let (n1, _d1) = make_node(12001, &network).await;
+    let data = b"replication integration test data".to_vec();
+    let config = ErasureConfig::new(2, 1).unwrap();
+    let result = n1
+        .store_with_config(data.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Node 2 joins — should receive chunks via proactive replication
+    let (n2, _d2) = make_node(12002, &network).await;
+    n2.bootstrap(vec![n1.local_addr()]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Shut down node 1
+    n1.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Node 2 should be able to retrieve the data
+    let retrieved = n2.retrieve(&result).await.unwrap();
+    assert_eq!(retrieved, data);
+
+    n2.shutdown().await;
+}

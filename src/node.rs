@@ -36,6 +36,117 @@ async fn send_request_any<T: Transport>(
     Err(last_err)
 }
 
+/// Proactively replicate locally-stored chunks to a newly discovered node,
+/// but only for chunks where the new node falls within the K-closest set.
+async fn replicate_chunks_to_node<T: Transport>(
+    ctx: &HandlerContext<T>,
+    new_node: &NodeInfo,
+) {
+    if new_node.addresses.is_empty() || new_node.node_id == ctx.node_id {
+        return;
+    }
+
+    // Get all content keys we are a provider for.
+    let metadata = ctx.metadata.clone();
+    let node_id = *ctx.node_id.as_bytes();
+    let own_keys = match tokio::task::spawn_blocking(move || {
+        metadata
+            .lock()
+            .map_err(|_| {
+                TesseraError::Network("metadata lock poisoned".into())
+            })?
+            .get_own_providers(&node_id)
+    })
+    .await
+    {
+        Ok(Ok(keys)) => keys,
+        _ => return,
+    };
+
+    if own_keys.is_empty() {
+        return;
+    }
+
+    // Filter: only replicate chunks where new_node is within K-closest.
+    let k = ctx.config.k;
+    let mut keys_to_replicate = Vec::new();
+    {
+        let rt = ctx.routing_table.lock().await;
+        for key in &own_keys {
+            let target = NodeId::from_bytes(*key);
+            let closest = rt.closest_nodes(&target, k);
+            if closest.iter().any(|n| n.node_id == new_node.node_id) {
+                keys_to_replicate.push(*key);
+            }
+        }
+    }
+
+    if keys_to_replicate.is_empty() {
+        return;
+    }
+
+    counter!(crate::metrics::REPLICATION_TRIGGER_TOTAL, crate::metrics::LABEL_TYPE => "reactive")
+        .increment(1);
+    tracing::info!(
+        chunks = keys_to_replicate.len(),
+        new_node = %hex::encode(&new_node.node_id.as_bytes()[..4]),
+        "replicating chunks to new node"
+    );
+
+    let sem = Arc::new(Semaphore::new(ctx.config.replication_concurrency));
+    let mut handles = Vec::new();
+
+    for key in &keys_to_replicate {
+        let chunk_data = match ctx.chunks.get(key).await {
+            Ok(Some(data)) => data,
+            _ => continue,
+        };
+
+        let mut msg = Message::new(
+            *ctx.node_id.as_bytes(),
+            ctx.keypair.public_key_bytes(),
+            ctx.pow.clone(),
+            Payload::PutChunkRequest {
+                chunk_hash: *key,
+                data: chunk_data,
+            },
+        );
+        msg.client_mode = ctx.config.client_mode;
+        msg.sign(&ctx.keypair);
+
+        let transport = ctx.transport.clone();
+        let addrs = new_node.addresses.clone();
+        let sem = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                send_request_any(&*transport, &addrs, &msg),
+            )
+            .await;
+            matches!(result, Ok(Ok(_)))
+        }));
+    }
+
+    let mut sent = 0u64;
+    for handle in handles {
+        match tokio::time::timeout(Duration::from_secs(10), handle).await {
+            Ok(Ok(true)) => sent += 1,
+            Ok(Ok(false)) | Ok(Err(_)) => {}
+            Err(_) => {} // timeout
+        }
+    }
+
+    if sent > 0 {
+        counter!(crate::metrics::REPLICATION_CHUNKS_SENT_TOTAL).increment(sent);
+        tracing::info!(
+            sent,
+            new_node = %hex::encode(&new_node.node_id.as_bytes()[..4]),
+            "proactive replication complete"
+        );
+    }
+}
+
 /// Configurable parameters for a Tessera DHT node.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -62,6 +173,12 @@ pub struct NodeConfig {
     pub client_mode: bool,
     /// Default erasure coding configuration for store operations.
     pub erasure_config: ErasureConfig,
+    /// Proactively replicate chunks to newly discovered nodes that fall within
+    /// the K-closest set for those chunks.
+    pub proactive_replication: bool,
+    /// Maximum number of concurrent outbound PutChunkRequest RPCs during
+    /// proactive replication.
+    pub replication_concurrency: usize,
 }
 
 impl Default for NodeConfig {
@@ -86,6 +203,8 @@ impl Default for NodeConfig {
             max_concurrent_handlers: 256,
             client_mode: false,
             erasure_config: ErasureConfig::default(),
+            proactive_replication: true,
+            replication_concurrency: 3,
         }
     }
 }
@@ -116,6 +235,12 @@ enum Command {
         reply: oneshot::Sender<Result<Vec<u8>, TesseraError>>,
     },
     Shutdown,
+}
+
+/// Local routing table statistics (no network I/O).
+#[derive(Debug, Clone)]
+pub struct RoutingTableStats {
+    pub peer_count: usize,
 }
 
 /// Result of storing a tessera.
@@ -194,6 +319,7 @@ pub struct NodeHandle {
     node_id: NodeId,
     local_addr: SocketAddr,
     erasure_config: ErasureConfig,
+    routing_table: Arc<Mutex<RoutingTable>>,
 }
 
 impl NodeHandle {
@@ -262,6 +388,15 @@ impl NodeHandle {
             .map_err(|_| TesseraError::Network("node stopped".into()))?;
         rx.await
             .map_err(|_| TesseraError::Network("node stopped".into()))?
+    }
+
+    /// Returns local routing table statistics without any network I/O.
+    ///
+    /// Reads the routing table directly (shared `Arc<Mutex<>>`), bypassing
+    /// the actor command queue so it never blocks behind slow RPCs.
+    pub async fn routing_table_info(&self) -> RoutingTableStats {
+        let peer_count = self.routing_table.lock().await.len();
+        RoutingTableStats { peer_count }
     }
 
     /// Look up providers for a content key.
@@ -582,29 +717,76 @@ impl NodeBuilder {
 
         // Start mDNS discovery
         if self.mdns {
-            let port = handle.local_addr().port();
+            let local_addr = handle.local_addr();
+            let port = local_addr.port();
+            let local_ip = local_addr.ip();
             let handle_clone = handle.cmd_tx.clone();
             let node_id = handle.node_id;
-            if let Ok(mut mdns) =
-                crate::transport::mdns::MdnsDiscovery::new(port)
-            {
-                tokio::spawn(async move {
-                    while let Some(addr) = mdns.next_discovered().await {
-                        let (tx, _rx) = oneshot::channel();
-                        let _ = handle_clone
-                            .send(Command::Bootstrap {
-                                addrs: vec![addr],
-                                reply: tx,
-                            })
-                            .await;
-                        tracing::debug!(
-                            node_id = %hex::encode(&node_id.as_bytes()[..4]),
-                            "mDNS discovered peer at {}",
-                            addr
-                        );
-                    }
-                });
+            let node_id_short = hex::encode(&node_id.as_bytes()[..4]);
+            match crate::transport::mdns::MdnsDiscovery::new(port) {
+                Ok(mut mdns) => {
+                    tracing::debug!(
+                        node_id = %node_id_short,
+                        port = port,
+                        "mDNS discovery started"
+                    );
+                    let local_is_ipv4 = local_addr.is_ipv4();
+                    tokio::spawn(async move {
+                        while let Some(addr) = mdns.next_discovered().await {
+                            // Skip our own addresses to avoid self-bootstrap
+                            // loops that waste time and congest the actor.
+                            if addr.port() == port
+                                && (addr.ip() == local_ip
+                                    || addr.ip().is_loopback()
+                                    || local_ip.is_unspecified())
+                            {
+                                tracing::debug!(
+                                    peer = %addr,
+                                    "mDNS: skipping own address"
+                                );
+                                continue;
+                            }
+                            // Skip addresses incompatible with our socket's
+                            // address family. An IPv4-bound endpoint cannot
+                            // connect to IPv6 peers and vice-versa.
+                            if local_is_ipv4 && addr.is_ipv6() {
+                                tracing::debug!(
+                                    peer = %addr,
+                                    "mDNS: skipping IPv6 peer (bound to IPv4)"
+                                );
+                                continue;
+                            }
+                            if !local_is_ipv4
+                                && addr.is_ipv4()
+                                && !local_ip.is_unspecified()
+                            {
+                                tracing::debug!(
+                                    peer = %addr,
+                                    "mDNS: skipping IPv4 peer (bound to IPv6-only)"
+                                );
+                                continue;
+                            }
+                            tracing::debug!(
+                                node_id = %node_id_short,
+                                peer = %addr,
+                                "mDNS: bootstrapping discovered peer"
+                            );
+                            let (tx, _rx) = oneshot::channel();
+                            let _ = handle_clone
+                                .send(Command::Bootstrap {
+                                    addrs: vec![addr],
+                                    reply: tx,
+                                })
+                                .await;
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("mDNS discovery failed to start: {}", e);
+                }
             }
+        } else {
+            tracing::debug!("mDNS discovery disabled");
         }
 
         Ok(handle)
@@ -653,12 +835,14 @@ pub async fn spawn_node<T: Transport>(
     let erasure_config = config.erasure_config.clone();
     let config = Arc::new(config);
 
+    let routing_table = Arc::new(Mutex::new(routing_table));
+
     let actor = NodeActor {
         keypair,
         pow,
         node_id,
         transport,
-        routing_table: Arc::new(Mutex::new(routing_table)),
+        routing_table: routing_table.clone(),
         metadata: Arc::new(std::sync::Mutex::new(metadata)),
         chunks: Arc::new(chunks),
         cmd_rx,
@@ -667,6 +851,7 @@ pub async fn spawn_node<T: Transport>(
         write_limiter,
         peer_chunk_counts,
         config,
+        last_maintenance_time: std::time::Instant::now(),
     };
 
     tokio::spawn(actor.run());
@@ -676,6 +861,7 @@ pub async fn spawn_node<T: Transport>(
         node_id,
         local_addr,
         erasure_config,
+        routing_table,
     }
 }
 
@@ -693,9 +879,9 @@ struct NodeActor<T: Transport> {
     write_limiter: Arc<std::sync::Mutex<RateLimiter>>,
     peer_chunk_counts: Arc<std::sync::Mutex<HashMap<[u8; 32], u32>>>,
     config: Arc<NodeConfig>,
+    last_maintenance_time: std::time::Instant,
 }
 
-#[derive(Clone)]
 struct HandlerContext<T: Transport> {
     keypair: Keypair,
     pow: PowProof,
@@ -710,8 +896,26 @@ struct HandlerContext<T: Transport> {
     config: Arc<NodeConfig>,
 }
 
-impl<T: Transport> NodeActor<T> {
-    /// Create a new outgoing message with the actor's identity and client_mode flag.
+impl<T: Transport> Clone for HandlerContext<T> {
+    fn clone(&self) -> Self {
+        Self {
+            keypair: self.keypair.clone(),
+            pow: self.pow.clone(),
+            node_id: self.node_id,
+            transport: self.transport.clone(),
+            routing_table: self.routing_table.clone(),
+            metadata: self.metadata.clone(),
+            chunks: self.chunks.clone(),
+            relay_limiter: self.relay_limiter.clone(),
+            write_limiter: self.write_limiter.clone(),
+            peer_chunk_counts: self.peer_chunk_counts.clone(),
+            config: self.config.clone(),
+        }
+    }
+}
+
+impl<T: Transport> HandlerContext<T> {
+    /// Create a new outgoing message with the node's identity and client_mode flag.
     fn new_message(&self, payload: Payload) -> Message {
         let mut msg = Message::new(
             *self.node_id.as_bytes(),
@@ -723,407 +927,10 @@ impl<T: Transport> NodeActor<T> {
         msg
     }
 
-    fn handler_context(&self) -> HandlerContext<T> {
-        HandlerContext {
-            keypair: self.keypair.clone(),
-            pow: self.pow.clone(),
-            node_id: self.node_id,
-            transport: self.transport.clone(),
-            routing_table: self.routing_table.clone(),
-            metadata: self.metadata.clone(),
-            chunks: self.chunks.as_ref().clone(),
-            relay_limiter: self.relay_limiter.clone(),
-            write_limiter: self.write_limiter.clone(),
-            peer_chunk_counts: self.peer_chunk_counts.clone(),
-            config: self.config.clone(),
-        }
-    }
-
-    async fn run(mut self) {
-        let mut rt_save_tick =
-            tokio::time::interval(self.config.rt_save_interval);
-        rt_save_tick.tick().await; // consume the immediate first tick
-
-        let mut provider_tick =
-            tokio::time::interval(self.config.provider_republish_interval);
-        provider_tick.tick().await; // consume the immediate first tick
-
-        let mut refresh_tick =
-            tokio::time::interval(self.config.bucket_refresh_interval);
-        refresh_tick.tick().await; // consume the immediate first tick
-
-        let mut limiter_cleanup_tick =
-            tokio::time::interval(Duration::from_secs(60));
-        limiter_cleanup_tick.tick().await; // consume the immediate first tick
-
-        loop {
-            tokio::select! {
-                // Handle inbound RPC
-                result = self.transport.recv_request() => {
-                    match result {
-                        Ok((from_addr, msg)) => {
-                            let permit = match self.handler_semaphore.clone().try_acquire_owned() {
-                                Ok(permit) => permit,
-                                Err(_) => {
-                                    counter!(crate::metrics::HANDLER_DROPPED_TOTAL).increment(1);
-                                    tracing::warn!("dropping inbound message: handler limit reached");
-                                    continue;
-                                }
-                            };
-                            let ctx = self.handler_context();
-                            tokio::spawn(async move {
-                                handle_inbound_message(ctx, from_addr, msg).await;
-                                drop(permit);
-                            });
-                        }
-                        Err(e) => {
-                            if e.is_channel_closed() {
-                                tracing::error!("transport channel closed, shutting down: {}", e);
-                                break;
-                            }
-                            tracing::warn!("transient recv error (continuing): {}", e);
-                            // Continue processing — transient errors should not kill the node
-                        }
-                    }
-                }
-                // Handle commands from the handle
-                cmd = self.cmd_rx.recv() => {
-                    match cmd {
-                        Some(Command::Shutdown) | None => break,
-                        Some(cmd) => self.handle_command(cmd).await,
-                    }
-                }
-                // Periodic routing table save (Gap F)
-                _ = rt_save_tick.tick() => {
-                    let rt_size = self.routing_table.lock().await.len();
-                    gauge!(crate::metrics::ROUTING_TABLE_SIZE).set(rt_size as f64);
-                    self.save_routing_table().await;
-                }
-                // Periodic provider maintenance (Gap E)
-                _ = provider_tick.tick() => {
-                    self.do_provider_maintenance().await;
-                }
-                // Periodic bucket refresh (S8)
-                _ = refresh_tick.tick() => {
-                    self.do_bucket_refresh().await;
-                }
-                // Periodic cleanup of relay/write rate limiters (I17) and peer chunk counts (S16)
-                _ = limiter_cleanup_tick.tick() => {
-                    if let Ok(mut rl) = self.relay_limiter.lock() {
-                        rl.cleanup(Duration::from_secs(300));
-                    }
-                    if let Ok(mut wl) = self.write_limiter.lock() {
-                        wl.cleanup(Duration::from_secs(300));
-                    }
-                    // Prune peer_chunk_counts for peers no longer in the routing table (S16)
-                    let known_ids: std::collections::HashSet<[u8; 32]> = {
-                        let rt = self.routing_table.lock().await;
-                        rt.all_nodes_serde().iter().map(|n| n.node_id).collect()
-                    };
-                    if let Ok(mut counts) = self.peer_chunk_counts.lock() {
-                        counts.retain(|id, _| known_ids.contains(id));
-                    }
-                }
-            }
-        }
-
-        // Save routing table on shutdown (Gap F) — sync to avoid cancellation
-        // during runtime teardown.
-        let peers = self.routing_table.lock().await.all_nodes_serde();
-        self.save_routing_table_sync(&peers);
-    }
-
-    #[instrument(skip(self, cmd))]
-    async fn handle_command(&self, cmd: Command) {
-        match cmd {
-            Command::Bootstrap { addrs, reply } => {
-                let result = self.do_bootstrap(addrs).await;
-                let _ = reply.send(result);
-            }
-            Command::FindNode { target, reply } => {
-                let result = self.do_iterative_find_node(target).await;
-                let _ = reply.send(result);
-            }
-            Command::GetProviders { key, reply } => {
-                let result = self.do_get_providers(key).await;
-                let _ = reply.send(result);
-            }
-            Command::StoreTessera {
-                data,
-                config,
-                reply,
-            } => {
-                let result = self.do_store_tessera(data, config).await;
-                let _ = reply.send(result);
-            }
-            Command::RetrieveTessera {
-                chunk_hashes,
-                config,
-                original_len,
-                reply,
-            } => {
-                let result = self
-                    .do_retrieve_tessera(chunk_hashes, config, original_len)
-                    .await;
-                let _ = reply.send(result);
-            }
-            Command::Shutdown => {} // handled in run loop
-        }
-    }
-
-    // --- Maintenance ---
-
-    #[instrument(skip(self))]
-    async fn save_routing_table(&self) {
-        let peers = self.routing_table.lock().await.all_nodes_serde();
-        let metadata = self.metadata.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            metadata
-                .lock()
-                .map_err(|_| {
-                    TesseraError::Network("metadata lock poisoned".into())
-                })?
-                .save_peers_batch(&peers)
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => {
-                tracing::info!("saved routing table");
-            }
-            Ok(Err(e)) => tracing::warn!("failed to save routing table: {}", e),
-            Err(e) if e.is_cancelled() => {
-                tracing::debug!("save_routing_table task cancelled (runtime shutting down)");
-            }
-            Err(e) => tracing::warn!("save_routing_table task panicked: {}", e),
-        }
-    }
-
-    /// Save routing table synchronously — used on shutdown so the save cannot
-    /// be cancelled by runtime teardown.
-    fn save_routing_table_sync(&self, peers: &[crate::routing::NodeInfoSerde]) {
-        let result = self
-            .metadata
-            .lock()
-            .map_err(|_| TesseraError::Network("metadata lock poisoned".into()))
-            .and_then(|mut md| md.save_peers_batch(peers));
-        match result {
-            Ok(()) => tracing::info!("saved routing table on shutdown"),
-            Err(e) => tracing::warn!("failed to save routing table on shutdown: {}", e),
-        }
-    }
-
-    #[instrument(skip(self))]
-    async fn do_provider_maintenance(&self) {
-        // 1. Cleanup expired providers
-        let metadata = self.metadata.clone();
-        match tokio::task::spawn_blocking(move || {
-            metadata
-                .lock()
-                .map_err(|_| {
-                    TesseraError::Network("metadata lock poisoned".into())
-                })?
-                .cleanup_expired_providers()
-        })
-        .await
-        {
-            Ok(Ok(n)) if n > 0 => {
-                counter!(crate::metrics::PROVIDER_EXPIRED_TOTAL)
-                    .increment(n as u64);
-                tracing::info!("cleaned up {} expired provider records", n)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("failed to cleanup expired providers: {}", e)
-            }
-            Err(e) => {
-                tracing::warn!("cleanup task panicked: {}", e)
-            }
-            _ => {}
-        }
-
-        // 2. Get content keys we provide for
-        let metadata = self.metadata.clone();
-        let node_id = *self.node_id.as_bytes();
-        let own_keys = match tokio::task::spawn_blocking(move || {
-            metadata
-                .lock()
-                .map_err(|_| {
-                    TesseraError::Network("metadata lock poisoned".into())
-                })?
-                .get_own_providers(&node_id)
-        })
-        .await
-        {
-            Ok(Ok(keys)) => keys,
-            Ok(Err(e)) => {
-                tracing::warn!("failed to get own providers: {}", e);
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("get_own_providers task panicked: {}", e);
-                return;
-            }
-        };
-
-        if own_keys.is_empty() {
-            return;
-        }
-
-        counter!(crate::metrics::PROVIDER_REPUBLISHED_TOTAL)
-            .increment(own_keys.len() as u64);
-        tracing::info!("republishing {} provider records", own_keys.len());
-
-        // 3. Re-announce each key to closest nodes
-        let local_addr = self.transport.local_addr();
-        for key in &own_keys {
-            // Refresh our own provider record TTL
-            let metadata = self.metadata.clone();
-            let node_id = *self.node_id.as_bytes();
-            let public_key = self.keypair.public_key_bytes();
-            let key_copy = *key;
-            let provider_ttl = self.config.provider_ttl;
-            let _ = tokio::task::spawn_blocking(move || {
-                metadata
-                    .lock()
-                    .map_err(|_| {
-                        TesseraError::Network("metadata lock poisoned".into())
-                    })?
-                    .add_provider(
-                        &key_copy,
-                        &node_id,
-                        &public_key,
-                        &[local_addr],
-                        provider_ttl,
-                    )
-            })
-            .await;
-
-            // Announce to K closest peers
-            let target = NodeId::from_bytes(*key);
-            let closest = self
-                .routing_table
-                .lock()
-                .await
-                .closest_nodes(&target, self.config.k);
-
-            for node in closest.iter().take(self.config.k) {
-                if node.addresses.is_empty() || node.node_id == self.node_id {
-                    continue;
-                }
-                let mut msg = self.new_message(Payload::AddProviderRequest {
-                    key: *key,
-                    addresses: vec![local_addr],
-                });
-                msg.sign(&self.keypair);
-                let transport = self.transport.clone();
-                let addrs = node.addresses.clone();
-                tokio::spawn(async move {
-                    let _ = send_request_any(&*transport, &addrs, &msg).await;
-                });
-            }
-        }
-    }
-
-    // --- Bucket refresh ---
-
-    #[instrument(skip(self))]
-    async fn do_bucket_refresh(&self) {
-        let stale = {
-            let rt = self.routing_table.lock().await;
-            rt.stale_bucket_indices(self.config.bucket_refresh_interval)
-        };
-        if stale.is_empty() {
-            return;
-        }
-        tracing::info!("refreshing {} stale buckets", stale.len());
-        for idx in stale {
-            let target = {
-                let rt = self.routing_table.lock().await;
-                rt.random_id_for_bucket(idx)
-            };
-            let _ = self.do_iterative_find_node(target).await;
-        }
-    }
-
-    // --- Relay helpers ---
-
-    /// Try to send a message via relay nodes when direct communication fails.
-    /// Picks the closest nodes to our own ID as relay candidates.
-    #[instrument(skip(self, msg), fields(target = %hex::encode(&target_id.as_bytes()[..4])))]
-    async fn send_via_relay(
-        &self,
-        target_id: &NodeId,
-        msg: Message,
-    ) -> Result<Message, TesseraError> {
-        let candidates = self
-            .routing_table
-            .lock()
-            .await
-            .closest_nodes(&self.node_id, self.config.k);
-        let msg_bytes = msg.to_bytes().map_err(|e| {
-            TesseraError::Serialization(format!(
-                "failed to serialize inner message: {}",
-                e
-            ))
-        })?;
-
-        for candidate in &candidates {
-            if candidate.node_id == *target_id
-                || candidate.node_id == self.node_id
-                || candidate.addresses.is_empty()
-            {
-                continue;
-            }
-
-            let mut relay_msg = self.new_message(Payload::RelayRequest {
-                target_id: *target_id.as_bytes(),
-                payload: msg_bytes.clone(),
-                relay_hops: 0,
-            });
-            relay_msg.sign(&self.keypair);
-
-            match send_request_any(
-                &*self.transport,
-                &candidate.addresses,
-                &relay_msg,
-            )
-            .await
-            {
-                Ok(resp) => {
-                    if let Payload::RelayResponse { ok: true, payload } =
-                        resp.payload
-                    {
-                        let inner_resp = Message::from_bytes(&payload).map_err(|e| {
-                            TesseraError::Serialization(format!(
-                                "failed to deserialize relayed response: {}",
-                                e
-                            ))
-                        })?;
-                        return Ok(inner_resp);
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
-
-        Err(TesseraError::Network("all relay candidates failed".into()))
-    }
-
-    /// Try direct send to each address first, fall back to relay on failure (S19).
-    #[instrument(skip(self, msg), fields(target = %hex::encode(&target_id.as_bytes()[..4])))]
-    async fn send_or_relay(
-        &self,
-        addrs: &[SocketAddr],
-        target_id: &NodeId,
-        msg: Message,
-    ) -> Result<Message, TesseraError> {
-        match send_request_any(&*self.transport, addrs, &msg).await {
-            Ok(resp) => Ok(resp),
-            Err(_) => self.send_via_relay(target_id, msg).await,
-        }
-    }
-
-    // --- Bootstrap ---
-
+    /// Bootstrap by pinging each address, then performing an iterative lookup.
+    ///
+    /// This is callable from a spawned task (unlike NodeActor methods) so that
+    /// the actor loop is not blocked during network I/O.
     #[instrument(skip(self, addrs), fields(num_addrs = addrs.len()))]
     async fn do_bootstrap(
         &self,
@@ -1142,6 +949,10 @@ impl<T: Transport> NodeActor<T> {
                 }
                 Err(e) => {
                     tracing::warn!("bootstrap ping to {} failed: {}", addr, e);
+                    self.routing_table
+                        .lock()
+                        .await
+                        .record_failure_by_addr(addr, self.config.max_failures);
                 }
             }
         }
@@ -1180,8 +991,7 @@ impl<T: Transport> NodeActor<T> {
         Ok(())
     }
 
-    // --- Iterative Find Node ---
-
+    /// Iterative Kademlia node lookup, callable from spawned tasks.
     #[instrument(skip(self), fields(target = %hex::encode(&target.as_bytes()[..4])))]
     async fn do_iterative_find_node(
         &self,
@@ -1303,8 +1113,6 @@ impl<T: Transport> NodeActor<T> {
                         let returned: Vec<NodeInfo> = nodes
                             .into_iter()
                             .map(|n| {
-                                // Also insert discovered nodes into routing table
-                                // (fire-and-forget: we clone rt for a blocking insert)
                                 NodeInfo::new(
                                     NodeId::from_bytes(n.node_id),
                                     n.public_key,
@@ -1331,6 +1139,525 @@ impl<T: Transport> NodeActor<T> {
         histogram!(crate::metrics::LOOKUP_DURATION_SECONDS, crate::metrics::LABEL_TYPE => "find_node")
             .record(start.elapsed().as_secs_f64());
         Ok(result)
+    }
+}
+
+impl<T: Transport> NodeActor<T> {
+    /// Create a new outgoing message with the actor's identity and client_mode flag.
+    fn new_message(&self, payload: Payload) -> Message {
+        let mut msg = Message::new(
+            *self.node_id.as_bytes(),
+            self.keypair.public_key_bytes(),
+            self.pow.clone(),
+            payload,
+        );
+        msg.client_mode = self.config.client_mode;
+        msg
+    }
+
+    fn handler_context(&self) -> HandlerContext<T> {
+        HandlerContext {
+            keypair: self.keypair.clone(),
+            pow: self.pow.clone(),
+            node_id: self.node_id,
+            transport: self.transport.clone(),
+            routing_table: self.routing_table.clone(),
+            metadata: self.metadata.clone(),
+            chunks: self.chunks.as_ref().clone(),
+            relay_limiter: self.relay_limiter.clone(),
+            write_limiter: self.write_limiter.clone(),
+            peer_chunk_counts: self.peer_chunk_counts.clone(),
+            config: self.config.clone(),
+        }
+    }
+
+    async fn run(mut self) {
+        let mut rt_save_tick =
+            tokio::time::interval(self.config.rt_save_interval);
+        rt_save_tick.tick().await; // consume the immediate first tick
+
+        let mut provider_tick =
+            tokio::time::interval(self.config.provider_republish_interval);
+        provider_tick.tick().await; // consume the immediate first tick
+
+        let mut refresh_tick =
+            tokio::time::interval(self.config.bucket_refresh_interval);
+        refresh_tick.tick().await; // consume the immediate first tick
+
+        let mut limiter_cleanup_tick =
+            tokio::time::interval(Duration::from_secs(60));
+        limiter_cleanup_tick.tick().await; // consume the immediate first tick
+
+        loop {
+            tokio::select! {
+                // Handle inbound RPC
+                result = self.transport.recv_request() => {
+                    match result {
+                        Ok((from_addr, msg)) => {
+                            let permit = match self.handler_semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    counter!(crate::metrics::HANDLER_DROPPED_TOTAL).increment(1);
+                                    tracing::warn!("dropping inbound message: handler limit reached");
+                                    continue;
+                                }
+                            };
+                            let ctx = self.handler_context();
+                            tokio::spawn(async move {
+                                handle_inbound_message(ctx, from_addr, msg).await;
+                                drop(permit);
+                            });
+                        }
+                        Err(e) => {
+                            if e.is_channel_closed() {
+                                tracing::error!("transport channel closed, shutting down: {}", e);
+                                break;
+                            }
+                            tracing::warn!("transient recv error (continuing): {}", e);
+                            // Continue processing — transient errors should not kill the node
+                        }
+                    }
+                }
+                // Handle commands from the handle
+                cmd = self.cmd_rx.recv() => {
+                    match cmd {
+                        Some(Command::Shutdown) | None => break,
+                        // Spawn bootstrap into a background task so it does not
+                        // block the actor loop.  When two nodes bootstrap each
+                        // other simultaneously (e.g. via mDNS on the same
+                        // machine), blocking the loop would deadlock: each node
+                        // waits for the other's ping response while neither can
+                        // process inbound requests.
+                        Some(Command::Bootstrap { addrs, reply }) => {
+                            let ctx = self.handler_context();
+                            tokio::spawn(async move {
+                                let result = ctx.do_bootstrap(addrs).await;
+                                let _ = reply.send(result);
+                            });
+                        }
+                        Some(cmd) => self.handle_command(cmd).await,
+                    }
+                }
+                // Periodic routing table save (Gap F)
+                _ = rt_save_tick.tick() => {
+                    let rt_size = self.routing_table.lock().await.len();
+                    gauge!(crate::metrics::ROUTING_TABLE_SIZE).set(rt_size as f64);
+                    self.save_routing_table().await;
+                }
+                // Periodic provider maintenance (Gap E)
+                _ = provider_tick.tick() => {
+                    self.do_provider_maintenance().await;
+                }
+                // Periodic bucket refresh (S8)
+                _ = refresh_tick.tick() => {
+                    self.do_bucket_refresh().await;
+                }
+                // Periodic cleanup of relay/write rate limiters (I17) and peer chunk counts (S16)
+                _ = limiter_cleanup_tick.tick() => {
+                    if let Ok(mut rl) = self.relay_limiter.lock() {
+                        rl.cleanup(Duration::from_secs(300));
+                    }
+                    if let Ok(mut wl) = self.write_limiter.lock() {
+                        wl.cleanup(Duration::from_secs(300));
+                    }
+                    // Prune peer_chunk_counts for peers no longer in the routing table (S16)
+                    let known_ids: std::collections::HashSet<[u8; 32]> = {
+                        let rt = self.routing_table.lock().await;
+                        rt.all_nodes_serde().iter().map(|n| n.node_id).collect()
+                    };
+                    if let Ok(mut counts) = self.peer_chunk_counts.lock() {
+                        counts.retain(|id, _| known_ids.contains(id));
+                    }
+                }
+            }
+        }
+
+        // Save routing table on shutdown (Gap F) — sync to avoid cancellation
+        // during runtime teardown.
+        let peers = self.routing_table.lock().await.all_nodes_serde();
+        self.save_routing_table_sync(&peers);
+    }
+
+    #[instrument(skip(self, cmd))]
+    async fn handle_command(&self, cmd: Command) {
+        match cmd {
+            Command::Bootstrap { addrs, reply } => {
+                let result = self.do_bootstrap(addrs).await;
+                let _ = reply.send(result);
+            }
+            Command::FindNode { target, reply } => {
+                let result = self.do_iterative_find_node(target).await;
+                let _ = reply.send(result);
+            }
+            Command::GetProviders { key, reply } => {
+                let result = self.do_get_providers(key).await;
+                let _ = reply.send(result);
+            }
+            Command::StoreTessera {
+                data,
+                config,
+                reply,
+            } => {
+                let result = self.do_store_tessera(data, config).await;
+                let _ = reply.send(result);
+            }
+            Command::RetrieveTessera {
+                chunk_hashes,
+                config,
+                original_len,
+                reply,
+            } => {
+                let result = self
+                    .do_retrieve_tessera(chunk_hashes, config, original_len)
+                    .await;
+                let _ = reply.send(result);
+            }
+            Command::Shutdown => {} // handled in run loop
+        }
+    }
+
+    // --- Maintenance ---
+
+    #[instrument(skip(self))]
+    async fn save_routing_table(&self) {
+        let peers = self.routing_table.lock().await.all_nodes_serde();
+        let metadata = self.metadata.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            metadata
+                .lock()
+                .map_err(|_| {
+                    TesseraError::Network("metadata lock poisoned".into())
+                })?
+                .save_peers_batch(&peers)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                tracing::info!("saved routing table");
+            }
+            Ok(Err(e)) => tracing::warn!("failed to save routing table: {}", e),
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!(
+                    "save_routing_table task cancelled (runtime shutting down)"
+                );
+            }
+            Err(e) => tracing::warn!("save_routing_table task panicked: {}", e),
+        }
+    }
+
+    /// Save routing table synchronously — used on shutdown so the save cannot
+    /// be cancelled by runtime teardown.
+    fn save_routing_table_sync(&self, peers: &[crate::routing::NodeInfoSerde]) {
+        let result = self
+            .metadata
+            .lock()
+            .map_err(|_| TesseraError::Network("metadata lock poisoned".into()))
+            .and_then(|mut md| md.save_peers_batch(peers));
+        match result {
+            Ok(()) => tracing::info!("saved routing table on shutdown"),
+            Err(e) => tracing::warn!(
+                "failed to save routing table on shutdown: {}",
+                e
+            ),
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn do_provider_maintenance(&mut self) {
+        // 1. Cleanup expired providers
+        let metadata = self.metadata.clone();
+        match tokio::task::spawn_blocking(move || {
+            metadata
+                .lock()
+                .map_err(|_| {
+                    TesseraError::Network("metadata lock poisoned".into())
+                })?
+                .cleanup_expired_providers()
+        })
+        .await
+        {
+            Ok(Ok(n)) if n > 0 => {
+                counter!(crate::metrics::PROVIDER_EXPIRED_TOTAL)
+                    .increment(n as u64);
+                tracing::info!("cleaned up {} expired provider records", n)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("failed to cleanup expired providers: {}", e)
+            }
+            Err(e) => {
+                tracing::warn!("cleanup task panicked: {}", e)
+            }
+            _ => {}
+        }
+
+        // 2. Get content keys we provide for
+        let metadata = self.metadata.clone();
+        let node_id = *self.node_id.as_bytes();
+        let own_keys = match tokio::task::spawn_blocking(move || {
+            metadata
+                .lock()
+                .map_err(|_| {
+                    TesseraError::Network("metadata lock poisoned".into())
+                })?
+                .get_own_providers(&node_id)
+        })
+        .await
+        {
+            Ok(Ok(keys)) => keys,
+            Ok(Err(e)) => {
+                tracing::warn!("failed to get own providers: {}", e);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("get_own_providers task panicked: {}", e);
+                return;
+            }
+        };
+
+        if own_keys.is_empty() {
+            return;
+        }
+
+        counter!(crate::metrics::PROVIDER_REPUBLISHED_TOTAL)
+            .increment(own_keys.len() as u64);
+        tracing::info!("republishing {} provider records", own_keys.len());
+
+        // 3. Re-announce each key to closest nodes
+        let local_addr = self.transport.local_addr();
+        for key in &own_keys {
+            // Refresh our own provider record TTL
+            let metadata = self.metadata.clone();
+            let node_id = *self.node_id.as_bytes();
+            let public_key = self.keypair.public_key_bytes();
+            let key_copy = *key;
+            let provider_ttl = self.config.provider_ttl;
+            let _ = tokio::task::spawn_blocking(move || {
+                metadata
+                    .lock()
+                    .map_err(|_| {
+                        TesseraError::Network("metadata lock poisoned".into())
+                    })?
+                    .add_provider(
+                        &key_copy,
+                        &node_id,
+                        &public_key,
+                        &[local_addr],
+                        provider_ttl,
+                    )
+            })
+            .await;
+
+            // Announce to K closest peers
+            let target = NodeId::from_bytes(*key);
+            let closest = self
+                .routing_table
+                .lock()
+                .await
+                .closest_nodes(&target, self.config.k);
+
+            for node in closest.iter().take(self.config.k) {
+                if node.addresses.is_empty() || node.node_id == self.node_id {
+                    continue;
+                }
+                let mut msg = self.new_message(Payload::AddProviderRequest {
+                    key: *key,
+                    addresses: vec![local_addr],
+                });
+                msg.sign(&self.keypair);
+                let transport = self.transport.clone();
+                let addrs = node.addresses.clone();
+                tokio::spawn(async move {
+                    let _ = send_request_any(&*transport, &addrs, &msg).await;
+                });
+            }
+        }
+
+        // 4. Proactive replication: replicate chunks to nodes that joined
+        //    since the last maintenance cycle.
+        if self.config.proactive_replication && !own_keys.is_empty() {
+            let last_maint = self.last_maintenance_time;
+            let sem =
+                Arc::new(Semaphore::new(self.config.replication_concurrency));
+            let mut total_sent = 0u64;
+
+            for key in &own_keys {
+                let target = NodeId::from_bytes(*key);
+                let closest = self
+                    .routing_table
+                    .lock()
+                    .await
+                    .closest_nodes(&target, self.config.k);
+
+                // Filter to nodes seen after last maintenance (recently joined).
+                let new_nodes: Vec<_> = closest
+                    .into_iter()
+                    .filter(|n| {
+                        n.node_id != self.node_id
+                            && !n.addresses.is_empty()
+                            && n.last_seen > last_maint
+                    })
+                    .collect();
+
+                if new_nodes.is_empty() {
+                    continue;
+                }
+
+                let chunk_data = match self.chunks.get(key).await {
+                    Ok(Some(data)) => data,
+                    _ => continue,
+                };
+
+                for node in &new_nodes {
+                    let mut msg = self.new_message(Payload::PutChunkRequest {
+                        chunk_hash: *key,
+                        data: chunk_data.clone(),
+                    });
+                    msg.sign(&self.keypair);
+                    let transport = self.transport.clone();
+                    let addrs = node.addresses.clone();
+                    let sem = sem.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire_owned().await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            send_request_any(&*transport, &addrs, &msg),
+                        )
+                        .await;
+                    });
+                    total_sent += 1;
+                }
+            }
+
+            if total_sent > 0 {
+                counter!(crate::metrics::REPLICATION_TRIGGER_TOTAL, crate::metrics::LABEL_TYPE => "periodic")
+                    .increment(1);
+                counter!(crate::metrics::REPLICATION_CHUNKS_SENT_TOTAL)
+                    .increment(total_sent);
+                tracing::info!(
+                    total_sent,
+                    "periodic proactive replication complete"
+                );
+            }
+        }
+
+        self.last_maintenance_time = std::time::Instant::now();
+    }
+
+    // --- Bucket refresh ---
+
+    #[instrument(skip(self))]
+    async fn do_bucket_refresh(&self) {
+        let stale = {
+            let rt = self.routing_table.lock().await;
+            rt.stale_bucket_indices(self.config.bucket_refresh_interval)
+        };
+        if stale.is_empty() {
+            return;
+        }
+        tracing::info!("refreshing {} stale buckets", stale.len());
+        for idx in stale {
+            let target = {
+                let rt = self.routing_table.lock().await;
+                rt.random_id_for_bucket(idx)
+            };
+            let _ = self.do_iterative_find_node(target).await;
+        }
+    }
+
+    // --- Relay helpers ---
+
+    /// Try to send a message via relay nodes when direct communication fails.
+    /// Picks the closest nodes to our own ID as relay candidates.
+    #[instrument(skip(self, msg), fields(target = %hex::encode(&target_id.as_bytes()[..4])))]
+    async fn send_via_relay(
+        &self,
+        target_id: &NodeId,
+        msg: Message,
+    ) -> Result<Message, TesseraError> {
+        let candidates = self
+            .routing_table
+            .lock()
+            .await
+            .closest_nodes(&self.node_id, self.config.k);
+        let msg_bytes = msg.to_bytes().map_err(|e| {
+            TesseraError::Serialization(format!(
+                "failed to serialize inner message: {}",
+                e
+            ))
+        })?;
+
+        for candidate in &candidates {
+            if candidate.node_id == *target_id
+                || candidate.node_id == self.node_id
+                || candidate.addresses.is_empty()
+            {
+                continue;
+            }
+
+            let mut relay_msg = self.new_message(Payload::RelayRequest {
+                target_id: *target_id.as_bytes(),
+                payload: msg_bytes.clone(),
+                relay_hops: 0,
+            });
+            relay_msg.sign(&self.keypair);
+
+            match send_request_any(
+                &*self.transport,
+                &candidate.addresses,
+                &relay_msg,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    if let Payload::RelayResponse { ok: true, payload } =
+                        resp.payload
+                    {
+                        let inner_resp = Message::from_bytes(&payload).map_err(|e| {
+                            TesseraError::Serialization(format!(
+                                "failed to deserialize relayed response: {}",
+                                e
+                            ))
+                        })?;
+                        return Ok(inner_resp);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        Err(TesseraError::Network("all relay candidates failed".into()))
+    }
+
+    /// Try direct send to each address first, fall back to relay on failure (S19).
+    #[instrument(skip(self, msg), fields(target = %hex::encode(&target_id.as_bytes()[..4])))]
+    async fn send_or_relay(
+        &self,
+        addrs: &[SocketAddr],
+        target_id: &NodeId,
+        msg: Message,
+    ) -> Result<Message, TesseraError> {
+        match send_request_any(&*self.transport, addrs, &msg).await {
+            Ok(resp) => Ok(resp),
+            Err(_) => self.send_via_relay(target_id, msg).await,
+        }
+    }
+
+    // --- Bootstrap ---
+
+    async fn do_bootstrap(
+        &self,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<(), TesseraError> {
+        self.handler_context().do_bootstrap(addrs).await
+    }
+
+    // --- Iterative Find Node ---
+
+    async fn do_iterative_find_node(
+        &self,
+        target: NodeId,
+    ) -> Result<Vec<NodeInfo>, TesseraError> {
+        self.handler_context().do_iterative_find_node(target).await
     }
 
     // --- Get Providers ---
@@ -1562,10 +1889,14 @@ impl<T: Transport> NodeActor<T> {
             }
         }
 
-        // Await distribution with per-handle timeout; record failures for dead peers
+        // Await distribution with per-handle timeout; record failures for dead peers.
+        // IMPORTANT: abort the task on timeout to release the semaphore permit.
+        // Without abort, timed-out tasks keep running (holding the permit) until
+        // the inner send_request completes (up to 30s), starving other tasks.
         let total = distribution_handles.len();
         let mut succeeded = 0usize;
         for (peer_id, handle) in distribution_handles {
+            let abort_handle = handle.abort_handle();
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(Ok(_))) => succeeded += 1,
                 Ok(Ok(Err(e))) => {
@@ -1583,6 +1914,7 @@ impl<T: Transport> NodeActor<T> {
                     tracing::debug!("distribution task panicked: {}", e)
                 }
                 Err(_) => {
+                    abort_handle.abort();
                     tracing::debug!(
                         "distribution RPC to {} timed out",
                         peer_id
@@ -1816,52 +2148,62 @@ async fn handle_inbound_message<T: Transport>(
             NodeInfo::new(sender_node_id, msg.sender_key, vec![from_addr]);
         let insert_result =
             ctx.routing_table.lock().await.insert(node_info.clone());
-        // Kademlia LRS eviction: if bucket is full, ping the least-recently-seen
-        // node. If it doesn't respond, evict it and insert the new node.
-        if let crate::routing::InsertResult::BucketFull { lrs_node_id } =
-            insert_result
-        {
-            let lrs_addr = {
-                let rt = ctx.routing_table.lock().await;
-                rt.closest_nodes(&lrs_node_id, 1)
-                    .into_iter()
-                    .find(|n| n.node_id == lrs_node_id)
-                    .and_then(|n| n.addresses.first().copied())
-            };
-            if let Some(addr) = lrs_addr {
-                let mut ping = Message::new(
-                    *ctx.node_id.as_bytes(),
-                    ctx.keypair.public_key_bytes(),
-                    ctx.pow.clone(),
-                    Payload::PingRequest,
-                );
-                ping.sign(&ctx.keypair);
-                let ping_result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    ctx.transport.send_request(&addr, ping),
-                )
-                .await;
-                match ping_result {
-                    Ok(Ok(_)) => {
-                        // LRS node is alive — keep it, discard the new node
-                        tracing::debug!(
-                            "LRS node {} responded, keeping in bucket",
-                            hex::encode(&lrs_node_id.as_bytes()[..4])
-                        );
-                    }
-                    _ => {
-                        // LRS node is dead — evict and insert the new node
-                        tracing::debug!(
-                            "LRS node {} unresponsive, evicting",
-                            hex::encode(&lrs_node_id.as_bytes()[..4])
-                        );
-                        ctx.routing_table
-                            .lock()
-                            .await
-                            .evict_and_insert(&lrs_node_id, node_info);
+        match insert_result {
+            crate::routing::InsertResult::Inserted => {
+                // Proactively replicate relevant chunks to the new node.
+                if ctx.config.proactive_replication {
+                    let ctx_clone = ctx.clone();
+                    let new_node = node_info.clone();
+                    tokio::spawn(async move {
+                        replicate_chunks_to_node(&ctx_clone, &new_node).await;
+                    });
+                }
+            }
+            crate::routing::InsertResult::BucketFull { lrs_node_id } => {
+                // Kademlia LRS eviction: if bucket is full, ping the
+                // least-recently-seen node. If it doesn't respond, evict
+                // it and insert the new node.
+                let lrs_addr = {
+                    let rt = ctx.routing_table.lock().await;
+                    rt.closest_nodes(&lrs_node_id, 1)
+                        .into_iter()
+                        .find(|n| n.node_id == lrs_node_id)
+                        .and_then(|n| n.addresses.first().copied())
+                };
+                if let Some(addr) = lrs_addr {
+                    let mut ping = Message::new(
+                        *ctx.node_id.as_bytes(),
+                        ctx.keypair.public_key_bytes(),
+                        ctx.pow.clone(),
+                        Payload::PingRequest,
+                    );
+                    ping.sign(&ctx.keypair);
+                    let ping_result = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        ctx.transport.send_request(&addr, ping),
+                    )
+                    .await;
+                    match ping_result {
+                        Ok(Ok(_)) => {
+                            tracing::debug!(
+                                "LRS node {} responded, keeping in bucket",
+                                hex::encode(&lrs_node_id.as_bytes()[..4])
+                            );
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "LRS node {} unresponsive, evicting",
+                                hex::encode(&lrs_node_id.as_bytes()[..4])
+                            );
+                            ctx.routing_table
+                                .lock()
+                                .await
+                                .evict_and_insert(&lrs_node_id, node_info);
+                        }
                     }
                 }
             }
+            crate::routing::InsertResult::Updated => {}
         }
     }
 
@@ -2827,5 +3169,129 @@ mod tests {
 
         handle.shutdown().await;
         peer.shutdown().await;
+    }
+
+    async fn make_node_with_config(
+        port: u16,
+        network: &InMemoryNetwork,
+        config: NodeConfig,
+    ) -> (NodeHandle, TempDir) {
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let transport =
+            Arc::new(InMemoryTransport::new(addr, network.clone()).await);
+        let keypair = Keypair::generate();
+        let pow = PowProof::generate(&keypair.public_key_bytes(), 0);
+        let dir = TempDir::new().unwrap();
+        let metadata = MetadataStore::in_memory().unwrap();
+        let chunks =
+            ChunkStore::new(&dir.path().join("chunks"), 10_000_000).unwrap();
+        let handle =
+            spawn_node(keypair, pow, transport, metadata, chunks, config).await;
+        (handle, dir)
+    }
+
+    #[tokio::test]
+    async fn test_proactive_replication_reactive() {
+        // Node A stores data alone, then node B joins. B should receive
+        // chunks via proactive replication triggered by InsertResult::Inserted.
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(14001, &network).await;
+
+        // Store data on node A (alone in the network)
+        let data = b"proactive replication test data".to_vec();
+        let config = ErasureConfig::new(2, 1).unwrap();
+        let result = node_a
+            .store_with_config(data.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Node B joins the network (bootstraps through A)
+        let (node_b, _dir_b) = make_node(14002, &network).await;
+        node_b.bootstrap(vec![node_a.local_addr()]).await.unwrap();
+
+        // Wait for replication to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Shut down node A — B should be able to retrieve the data if
+        // replication worked.
+        node_a.shutdown().await;
+
+        let retrieved = node_b.retrieve(&result).await.unwrap();
+        assert_eq!(retrieved, data);
+
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_proactive_replication_disabled() {
+        // With proactive_replication=false, no chunks should be replicated.
+        let network = new_in_memory_network();
+        let config_no_repl = NodeConfig {
+            min_pow_difficulty: 0,
+            proactive_replication: false,
+            ..Default::default()
+        };
+        let (node_a, _dir_a) =
+            make_node_with_config(15001, &network, config_no_repl.clone())
+                .await;
+
+        let data = b"no replication test".to_vec();
+        let ec = ErasureConfig::new(2, 1).unwrap();
+        let result = node_a
+            .store_with_config(data.clone(), ec.clone())
+            .await
+            .unwrap();
+
+        let (node_b, _dir_b) =
+            make_node_with_config(15002, &network, config_no_repl).await;
+        node_b.bootstrap(vec![node_a.local_addr()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Shut down A — B should NOT be able to retrieve since replication
+        // was disabled.
+        node_a.shutdown().await;
+
+        let result = node_b.retrieve(&result).await;
+        assert!(
+            result.is_err(),
+            "should fail to retrieve without replication"
+        );
+
+        node_b.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_proactive_replication_periodic() {
+        // Test that the periodic maintenance path also replicates chunks
+        // to recently joined nodes.
+        let network = new_in_memory_network();
+        let (node_a, _dir_a) = make_node(16001, &network).await;
+
+        let data = b"periodic replication test".to_vec();
+        let ec = ErasureConfig::new(2, 1).unwrap();
+        let result = node_a
+            .store_with_config(data.clone(), ec.clone())
+            .await
+            .unwrap();
+
+        // Node B joins
+        let (node_b, _dir_b) = make_node(16002, &network).await;
+        node_b.bootstrap(vec![node_a.local_addr()]).await.unwrap();
+        // Brief sleep to let bootstrap complete
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Advance the clock past the provider_republish_interval (1 hour)
+        // to trigger do_provider_maintenance which includes periodic replication.
+        tokio::time::advance(Duration::from_secs(3601)).await;
+        // Give the maintenance task time to run
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Shut down A — B should have received chunks via periodic replication.
+        node_a.shutdown().await;
+
+        let retrieved = node_b.retrieve(&result).await.unwrap();
+        assert_eq!(retrieved, data);
+
+        node_b.shutdown().await;
     }
 }

@@ -22,6 +22,9 @@ pub const PROVIDER_REPUBLISHED_TOTAL: &str =
 pub const RELAY_FORWARD_TOTAL: &str = "tessera_relay_forward_total";
 pub const LOOKUP_TOTAL: &str = "tessera_lookup_total";
 pub const BOOTSTRAP_TOTAL: &str = "tessera_bootstrap_total";
+pub const REPLICATION_CHUNKS_SENT_TOTAL: &str =
+    "tessera_replication_chunks_sent_total";
+pub const REPLICATION_TRIGGER_TOTAL: &str = "tessera_replication_trigger_total";
 
 // --- Gauge names ---
 
@@ -86,6 +89,14 @@ pub fn describe_metrics() {
     describe_counter!(RELAY_FORWARD_TOTAL, "Relay forward attempts");
     describe_counter!(LOOKUP_TOTAL, "Iterative lookup operations");
     describe_counter!(BOOTSTRAP_TOTAL, "Bootstrap operations");
+    describe_counter!(
+        REPLICATION_CHUNKS_SENT_TOTAL,
+        "Chunks proactively replicated to new nodes"
+    );
+    describe_counter!(
+        REPLICATION_TRIGGER_TOTAL,
+        "Proactive replication triggers (reactive or periodic)"
+    );
 
     // Gauges
     describe_gauge!(ROUTING_TABLE_SIZE, "Number of peers in routing table");
