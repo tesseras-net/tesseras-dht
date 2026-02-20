@@ -827,8 +827,10 @@ impl<T: Transport> NodeActor<T> {
             }
         }
 
-        // Save routing table on shutdown (Gap F)
-        self.save_routing_table().await;
+        // Save routing table on shutdown (Gap F) — sync to avoid cancellation
+        // during runtime teardown.
+        let peers = self.routing_table.lock().await.all_nodes_serde();
+        self.save_routing_table_sync(&peers);
     }
 
     #[instrument(skip(self, cmd))]
@@ -889,7 +891,24 @@ impl<T: Transport> NodeActor<T> {
                 tracing::info!("saved routing table");
             }
             Ok(Err(e)) => tracing::warn!("failed to save routing table: {}", e),
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!("save_routing_table task cancelled (runtime shutting down)");
+            }
             Err(e) => tracing::warn!("save_routing_table task panicked: {}", e),
+        }
+    }
+
+    /// Save routing table synchronously — used on shutdown so the save cannot
+    /// be cancelled by runtime teardown.
+    fn save_routing_table_sync(&self, peers: &[crate::routing::NodeInfoSerde]) {
+        let result = self
+            .metadata
+            .lock()
+            .map_err(|_| TesseraError::Network("metadata lock poisoned".into()))
+            .and_then(|mut md| md.save_peers_batch(peers));
+        match result {
+            Ok(()) => tracing::info!("saved routing table on shutdown"),
+            Err(e) => tracing::warn!("failed to save routing table on shutdown: {}", e),
         }
     }
 
