@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -27,10 +27,31 @@ async fn send_request_any<T: Transport>(
     msg: &Message,
 ) -> Result<Message, TesseraError> {
     let mut last_err = TesseraError::Network("no addresses to try".into());
+    tracing::debug!(
+        "send_request_any: trying {} addr(s) {:?} for msg_id={}",
+        addrs.len(),
+        addrs,
+        msg.msg_id
+    );
     for addr in addrs {
         match transport.send_request(addr, msg.clone()).await {
-            Ok(resp) => return Ok(resp),
-            Err(e) => last_err = e,
+            Ok(resp) => {
+                tracing::debug!(
+                    "send_request_any: success to {} msg_id={}",
+                    addr,
+                    msg.msg_id
+                );
+                return Ok(resp);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "send_request_any: failed to {} msg_id={}: {}",
+                    addr,
+                    msg.msg_id,
+                    e
+                );
+                last_err = e;
+            }
         }
     }
     Err(last_err)
@@ -935,10 +956,16 @@ impl<T: Transport> Clone for HandlerContext<T> {
 impl<T: Transport> HandlerContext<T> {
     /// Returns the externally observed address if available, otherwise local.
     async fn best_addr(&self) -> SocketAddr {
-        self.external_addr
-            .lock()
-            .await
-            .unwrap_or_else(|| self.transport.local_addr())
+        let external = *self.external_addr.lock().await;
+        let local = self.transport.local_addr();
+        let addr = external.unwrap_or(local);
+        tracing::debug!(
+            "best_addr: external={:?} local={} => using={}",
+            external,
+            local,
+            addr
+        );
+        addr
     }
 
     /// Create a new outgoing message with the node's identity and client_mode flag.
@@ -1046,7 +1073,16 @@ impl<T: Transport> HandlerContext<T> {
                         observed_addr: Some(ext),
                     } = &resp.payload
                     {
-                        *self.external_addr.lock().await = Some(*ext);
+                        let mut guard = self.external_addr.lock().await;
+                        let old = *guard;
+                        if old != Some(*ext) {
+                            tracing::info!(
+                                "NAT: external addr changed {:?} -> {}",
+                                old,
+                                ext
+                            );
+                        }
+                        *guard = Some(*ext);
                     }
 
                     let peer_id = NodeId::from_bytes(resp.sender_id);
@@ -1092,6 +1128,23 @@ impl<T: Transport> HandlerContext<T> {
             }
         } else {
             let _ = self.do_iterative_find_node(self.node_id).await;
+        }
+
+        // Log routing table state after bootstrap
+        {
+            let rt = self.routing_table.lock().await;
+            let all_nodes = rt.closest_nodes(&self.node_id, 100);
+            tracing::info!(
+                "bootstrap complete: routing_table has {} peers",
+                rt.len()
+            );
+            for node in &all_nodes {
+                tracing::info!(
+                    "  peer: node_id={} addrs={:?}",
+                    hex::encode(&node.node_id.as_bytes()[..8]),
+                    node.addresses
+                );
+            }
         }
 
         counter!(crate::metrics::BOOTSTRAP_TOTAL, crate::metrics::LABEL_STATUS => "ok").increment(1);
@@ -1252,10 +1305,16 @@ impl<T: Transport> HandlerContext<T> {
 impl<T: Transport> NodeActor<T> {
     /// Returns the externally observed address if available, otherwise local.
     async fn best_addr(&self) -> SocketAddr {
-        self.external_addr
-            .lock()
-            .await
-            .unwrap_or_else(|| self.transport.local_addr())
+        let external = *self.external_addr.lock().await;
+        let local = self.transport.local_addr();
+        let addr = external.unwrap_or(local);
+        tracing::debug!(
+            "best_addr: external={:?} local={} => using={}",
+            external,
+            local,
+            addr
+        );
+        addr
     }
 
     /// Create a new outgoing message with the actor's identity and client_mode flag.
@@ -1938,7 +1997,36 @@ impl<T: Transport> NodeActor<T> {
     ) -> Result<StoreTesseraResult, TesseraError> {
         let start = std::time::Instant::now();
         let announce_addr = self.best_addr().await;
+        tracing::info!(
+            "do_store_tessera: data_len={} announce_addr={} config={:?}",
+            data.len(),
+            announce_addr,
+            config
+        );
+
+        // Log routing table state
+        {
+            let rt = self.routing_table.lock().await;
+            let rt_size = rt.len();
+            let all_peers = rt.closest_nodes(&self.node_id, 100);
+            tracing::info!(
+                "do_store_tessera: routing table has {} peers",
+                rt_size
+            );
+            for peer in &all_peers {
+                tracing::debug!(
+                    "  rt peer: node_id={} addrs={:?}",
+                    hex::encode(&peer.node_id.as_bytes()[..8]),
+                    peer.addresses
+                );
+            }
+        }
+
         let encoded = erasure::encode(&data, &config)?;
+        tracing::info!(
+            "do_store_tessera: encoded into {} chunks",
+            encoded.chunk_hashes.len()
+        );
 
         // Store chunks locally first
         for (hash, chunk_data) in
@@ -1955,6 +2043,11 @@ impl<T: Transport> NodeActor<T> {
             tokio::task::JoinHandle<Result<Message, TesseraError>>,
         )> = Vec::new();
 
+        // Peers that failed during this store — shared with spawned tasks so they
+        // can bail out early instead of wasting a semaphore permit + 5s timeout.
+        let failed_peers: Arc<std::sync::Mutex<HashSet<NodeId>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
         // Distribute chunks to closest nodes for each chunk hash
         for (hash, chunk_data) in
             encoded.chunk_hashes.iter().zip(encoded.chunks.iter())
@@ -1966,10 +2059,39 @@ impl<T: Transport> NodeActor<T> {
                 .await
                 .closest_nodes(&target, self.config.k);
 
-            for node in closest.iter().take(self.config.alpha) {
+            tracing::info!(
+                "do_store_tessera: chunk {} -> {} closest peers (taking alpha={})",
+                hex::encode(&hash[..4]),
+                closest.len(),
+                self.config.alpha
+            );
+
+            let mut sent = 0;
+            for node in &closest {
+                if sent >= self.config.alpha {
+                    break;
+                }
                 if node.addresses.is_empty() || node.node_id == self.node_id {
                     continue;
                 }
+                // Skip peers already known to be unreachable
+                if failed_peers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&node.node_id)
+                {
+                    tracing::debug!(
+                        "do_store_tessera: skipping failed peer node_id={}",
+                        hex::encode(&node.node_id.as_bytes()[..4]),
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    "do_store_tessera: PutChunk {} -> node_id={} addrs={:?}",
+                    hex::encode(&hash[..4]),
+                    hex::encode(&node.node_id.as_bytes()[..4]),
+                    node.addresses
+                );
                 let mut msg = self.new_message(Payload::PutChunkRequest {
                     chunk_hash: *hash,
                     data: chunk_data.clone(),
@@ -1978,13 +2100,27 @@ impl<T: Transport> NodeActor<T> {
                 let transport = self.transport.clone();
                 let addrs = node.addresses.clone();
                 let sem = sem.clone();
+                let fp = failed_peers.clone();
+                let peer_id = node.node_id;
                 distribution_handles.push((
-                    node.node_id,
+                    peer_id,
                     tokio::spawn(async move {
+                        // Check again before acquiring permit (peer may have
+                        // failed while we were queued)
+                        if fp
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains(&peer_id)
+                        {
+                            return Err(TesseraError::Network(
+                                "peer marked as failed".into(),
+                            ));
+                        }
                         let _permit = sem.acquire_owned().await;
                         send_request_any(&*transport, &addrs, &msg).await
                     }),
                 ));
+                sent += 1;
             }
 
             // Also add ourselves as a provider
@@ -2019,8 +2155,19 @@ impl<T: Transport> NodeActor<T> {
                 .lock()
                 .await
                 .closest_nodes(&target, self.config.k);
-            for node in closest_to_chunk.iter().take(self.config.alpha) {
+            let mut sent = 0;
+            for node in &closest_to_chunk {
+                if sent >= self.config.alpha {
+                    break;
+                }
                 if node.addresses.is_empty() || node.node_id == self.node_id {
+                    continue;
+                }
+                if failed_peers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&node.node_id)
+                {
                     continue;
                 }
                 let mut msg = self.new_message(Payload::AddProviderRequest {
@@ -2031,13 +2178,25 @@ impl<T: Transport> NodeActor<T> {
                 let transport = self.transport.clone();
                 let addrs = node.addresses.clone();
                 let sem = sem.clone();
+                let fp = failed_peers.clone();
+                let peer_id = node.node_id;
                 distribution_handles.push((
-                    node.node_id,
+                    peer_id,
                     tokio::spawn(async move {
+                        if fp
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains(&peer_id)
+                        {
+                            return Err(TesseraError::Network(
+                                "peer marked as failed".into(),
+                            ));
+                        }
                         let _permit = sem.acquire_owned().await;
                         send_request_any(&*transport, &addrs, &msg).await
                     }),
                 ));
+                sent += 1;
             }
         }
 
@@ -2052,25 +2211,38 @@ impl<T: Transport> NodeActor<T> {
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(Ok(_))) => succeeded += 1,
                 Ok(Ok(Err(e))) => {
-                    tracing::debug!(
-                        "distribution RPC to {} failed: {}",
-                        peer_id,
-                        e
-                    );
-                    self.routing_table
-                        .lock()
-                        .await
-                        .record_failure(&peer_id, self.config.max_failures);
+                    let msg = e.to_string();
+                    if msg.contains("peer marked as failed") {
+                        // Already counted in failed_peers, no action needed
+                    } else {
+                        tracing::warn!(
+                            "store: distribution RPC to {} failed: {}",
+                            hex::encode(&peer_id.as_bytes()[..8]),
+                            e
+                        );
+                        failed_peers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(peer_id);
+                        self.routing_table
+                            .lock()
+                            .await
+                            .record_failure(&peer_id, self.config.max_failures);
+                    }
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!("distribution task panicked: {}", e)
+                    tracing::warn!("store: distribution task panicked: {}", e)
                 }
                 Err(_) => {
                     abort_handle.abort();
-                    tracing::debug!(
-                        "distribution RPC to {} timed out",
-                        peer_id
+                    tracing::warn!(
+                        "store: distribution RPC to {} timed out (5s)",
+                        hex::encode(&peer_id.as_bytes()[..8]),
                     );
+                    failed_peers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(peer_id);
                     self.routing_table
                         .lock()
                         .await
@@ -2078,7 +2250,17 @@ impl<T: Transport> NodeActor<T> {
                 }
             }
         }
-        tracing::info!("distributed to {}/{} peers", succeeded, total);
+        let failed_count = failed_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        tracing::info!(
+            "store: {}/{} RPCs succeeded, {} failed peers skipped, {:.1}s elapsed",
+            succeeded,
+            total,
+            failed_count,
+            start.elapsed().as_secs_f64()
+        );
 
         counter!(crate::metrics::STORE_TOTAL, crate::metrics::LABEL_STATUS => "ok").increment(1);
         histogram!(crate::metrics::STORE_DURATION_SECONDS)
@@ -2234,6 +2416,14 @@ async fn handle_inbound_message<T: Transport>(
     from_addr: SocketAddr,
     msg: Message,
 ) {
+    let payload_type = crate::metrics::payload_type_label(&msg.payload);
+    tracing::info!(
+        "handle_inbound_message: from={} msg_id={} payload={} client_mode={}",
+        from_addr,
+        msg.msg_id,
+        payload_type,
+        msg.client_mode
+    );
     // Identity verification: verify sender_id matches sender_key
     let sender_node_id = NodeId::from_bytes(msg.sender_id);
     let sender_vk = match ed25519_dalek::VerifyingKey::from_bytes(
@@ -2298,10 +2488,20 @@ async fn handle_inbound_message<T: Transport>(
     if !msg.client_mode {
         let node_info =
             NodeInfo::new(sender_node_id, msg.sender_key, vec![from_addr]);
+        tracing::info!(
+            "handle_inbound: inserting peer node_id={} from_addr={} into routing table",
+            hex::encode(&sender_node_id.as_bytes()[..8]),
+            from_addr
+        );
         let insert_result =
             ctx.routing_table.lock().await.insert(node_info.clone());
         match insert_result {
             crate::routing::InsertResult::Inserted => {
+                tracing::info!(
+                    "handle_inbound: INSERTED new peer node_id={} addr={}",
+                    hex::encode(&sender_node_id.as_bytes()[..8]),
+                    from_addr
+                );
                 // Proactively replicate relevant chunks to the new node.
                 if ctx.config.proactive_replication {
                     let ctx_clone = ctx.clone();
@@ -2312,6 +2512,12 @@ async fn handle_inbound_message<T: Transport>(
                 }
             }
             crate::routing::InsertResult::BucketFull { lrs_node_id } => {
+                tracing::info!(
+                    "handle_inbound: BUCKET FULL for node_id={} addr={}, LRS={}",
+                    hex::encode(&sender_node_id.as_bytes()[..8]),
+                    from_addr,
+                    hex::encode(&lrs_node_id.as_bytes()[..4])
+                );
                 // Kademlia LRS eviction: if bucket is full, ping the
                 // least-recently-seen node. If it doesn't respond, evict
                 // it and insert the new node.
@@ -2355,8 +2561,20 @@ async fn handle_inbound_message<T: Transport>(
                     }
                 }
             }
-            crate::routing::InsertResult::Updated => {}
+            crate::routing::InsertResult::Updated => {
+                tracing::debug!(
+                    "handle_inbound: UPDATED existing peer node_id={} addr={}",
+                    hex::encode(&sender_node_id.as_bytes()[..8]),
+                    from_addr
+                );
+            }
         }
+    } else {
+        tracing::debug!(
+            "handle_inbound: skipping client_mode peer node_id={} addr={}",
+            hex::encode(&sender_node_id.as_bytes()[..8]),
+            from_addr
+        );
     }
 
     let rpc_type = crate::metrics::payload_type_label(&msg.payload);
@@ -2580,6 +2798,13 @@ async fn handle_inbound_message<T: Transport>(
                             });
                             match target_node {
                                 Some(node) => {
+                                    tracing::info!(
+                                        "relay: forwarding from {} to target={} addrs={:?} inner_payload={}",
+                                        from_addr,
+                                        hex::encode(&target_id[..8]),
+                                        node.addresses,
+                                        crate::metrics::payload_type_label(&inner_msg.payload),
+                                    );
                                     match send_request_any(
                                         &*ctx.transport,
                                         &node.addresses,
@@ -2589,13 +2814,15 @@ async fn handle_inbound_message<T: Transport>(
                                     {
                                         Ok(resp) => match resp.to_bytes() {
                                             Ok(resp_bytes) => {
+                                                tracing::info!("relay: forward succeeded to {}", hex::encode(&target_id[..8]));
                                                 counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "ok").increment(1);
                                                 Payload::RelayResponse {
                                                     ok: true,
                                                     payload: resp_bytes,
                                                 }
                                             }
-                                            Err(_) => {
+                                            Err(e) => {
+                                                tracing::warn!("relay: forward response serialize failed to {}: {}", hex::encode(&target_id[..8]), e);
                                                 counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "rejected").increment(1);
                                                 Payload::RelayResponse {
                                                     ok: false,
@@ -2603,7 +2830,8 @@ async fn handle_inbound_message<T: Transport>(
                                                 }
                                             }
                                         },
-                                        Err(_) => {
+                                        Err(e) => {
+                                            tracing::warn!("relay: forward failed to {} addrs={:?}: {}", hex::encode(&target_id[..8]), node.addresses, e);
                                             counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "rejected").increment(1);
                                             Payload::RelayResponse {
                                                 ok: false,
@@ -2612,10 +2840,16 @@ async fn handle_inbound_message<T: Transport>(
                                         }
                                     }
                                 }
-                                None => Payload::RelayResponse {
-                                    ok: false,
-                                    payload: vec![],
-                                },
+                                None => {
+                                    tracing::warn!(
+                                        "relay: target {} not found in routing table",
+                                        hex::encode(&target_id[..8])
+                                    );
+                                    Payload::RelayResponse {
+                                        ok: false,
+                                        payload: vec![],
+                                    }
+                                }
                             }
                         }
                     }

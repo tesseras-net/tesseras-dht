@@ -5,6 +5,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::NodeId;
 
+/// Maximum number of addresses stored per peer to prevent unbounded growth.
+const MAX_PEER_ADDRS: usize = 8;
+
+/// Returns true if the address is a LAN/private/loopback address.
+/// Used to sort local addresses first when merging peer addresses,
+/// so `send_request_any` tries faster LAN paths before external NAT addresses.
+fn is_lan_addr(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_private() || ip.is_loopback() || ip.is_link_local()
+        }
+        std::net::IpAddr::V6(ip) => ip.is_loopback(),
+    }
+}
+
 /// Information about a known peer in the network.
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
@@ -127,7 +142,14 @@ impl KBucket {
             self.nodes.iter_mut().find(|n| n.node_id == node.node_id)
         {
             existing.mark_seen();
-            existing.addresses = node.addresses;
+            // Merge addresses: add new ones, dedup, prefer LAN addrs first
+            for addr in &node.addresses {
+                if !existing.addresses.contains(addr) {
+                    existing.addresses.push(*addr);
+                }
+            }
+            existing.addresses.sort_by_key(|a| !is_lan_addr(a));
+            existing.addresses.truncate(MAX_PEER_ADDRS);
             self.last_updated = Instant::now();
             return InsertResult::Updated;
         }

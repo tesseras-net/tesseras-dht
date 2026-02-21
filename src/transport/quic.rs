@@ -22,6 +22,9 @@ const RESPONSE_ONESHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CLIENT_RESPONSE_TIMEOUT_SECS: u64 = 30;
 const MAX_POOL_SIZE: usize = 128;
 const POOL_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+/// Keepalive interval to prevent NAT mapping expiry.
+/// Most NATs expire UDP mappings after 30-120s of inactivity.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Maximum wire message size: 4 MB data + 1 KB envelope overhead.
 pub(crate) const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024 + 1024;
 /// Maximum number of pending inbound response senders (prevents unbounded HashMap growth).
@@ -65,18 +68,24 @@ impl QuicTransport {
         )
         .map_err(|e| TesseraError::Network(format!("key: {}", e)))?;
 
+        // Shared transport config with NAT keepalive
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+        let transport_config = Arc::new(transport_config);
+
         // Server config
         let mut server_crypto = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], key_der.clone_key())
             .map_err(|e| TesseraError::Network(format!("server tls: {}", e)))?;
         server_crypto.alpn_protocols = vec![b"tessera/1".to_vec()];
-        let server_config = ServerConfig::with_crypto(Arc::new(
+        let mut server_config = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
                 .map_err(|e| {
                     TesseraError::Network(format!("quic server config: {}", e))
                 })?,
         ));
+        server_config.transport_config(transport_config.clone());
 
         // Client config (skip cert verification for P2P)
         let mut client_crypto = rustls::ClientConfig::builder()
@@ -84,12 +93,13 @@ impl QuicTransport {
             .with_custom_certificate_verifier(Arc::new(SkipVerification))
             .with_no_client_auth();
         client_crypto.alpn_protocols = vec![b"tessera/1".to_vec()];
-        let client_config = ClientConfig::new(Arc::new(
+        let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
                 .map_err(|e| {
                     TesseraError::Network(format!("quic client config: {}", e))
                 })?,
         ));
+        client_config.transport_config(transport_config);
 
         let socket = create_udp_socket(bind_addr)?;
         let runtime = Arc::new(quinn::TokioRuntime);
@@ -198,8 +208,8 @@ impl QuicTransport {
                         let stream = match conn.accept_bi().await {
                             Ok(s) => s,
                             Err(e) => {
-                                tracing::debug!(
-                                    "QUIC: accept_bi error from {}: {}",
+                                tracing::warn!(
+                                    "QUIC: connection lost to {}: {}",
                                     remote_addr,
                                     e
                                 );
@@ -332,7 +342,22 @@ impl QuicTransport {
             loop {
                 interval.tick().await;
                 let mut pool = pool_cleanup.lock().await;
-                pool.retain(|_, entry| entry.conn.close_reason().is_none());
+                let before = pool.len();
+                pool.retain(|addr, entry| {
+                    let alive = entry.conn.close_reason().is_none();
+                    if !alive {
+                        tracing::info!("conn_pool: pruned dead connection to {}", addr);
+                    }
+                    alive
+                });
+                let removed = before - pool.len();
+                if removed > 0 {
+                    tracing::info!(
+                        "conn_pool: cleanup removed {} dead connections ({} remaining)",
+                        removed,
+                        pool.len()
+                    );
+                }
             }
         }));
 
@@ -371,7 +396,7 @@ impl QuicTransport {
         counter!(crate::metrics::CONN_POOL_MISS_TOTAL).increment(1);
         drop(pool);
 
-        tracing::debug!("connection_pool: creating new connection to {}", addr);
+        tracing::info!("conn_pool: new outbound connection to {}", addr);
         let connecting = self
             .endpoint
             .connect(*addr, "tessera")
@@ -380,15 +405,16 @@ impl QuicTransport {
             tokio::time::timeout(self.client_response_timeout, connecting)
                 .await
                 .map_err(|_| {
-                    tracing::debug!(
-                        "connection_pool: connect timed out to {}",
+                    tracing::warn!(
+                        "conn_pool: connect timed out to {} ({}s)",
                         addr,
+                        self.client_response_timeout.as_secs(),
                     );
                     TesseraError::Timeout
                 })?
                 .map_err(|e| {
-                    tracing::debug!(
-                        "connection_pool: connect failed to {}: {}",
+                    tracing::warn!(
+                        "conn_pool: connect failed to {}: {}",
                         addr,
                         e
                     );
