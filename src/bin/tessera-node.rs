@@ -351,6 +351,8 @@ async fn cmd_get(
         chunk_hashes,
         config,
         original_len,
+        block_size: 0,
+        manifest_hash: None,
     };
     match handle.retrieve(&result).await {
         Ok(data) => {

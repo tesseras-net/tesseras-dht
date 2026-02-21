@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use ed25519_dalek;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::time::sleep;
+
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::erasure::{self, ErasureConfig};
 use crate::error::TesseraError;
@@ -20,41 +23,59 @@ use crate::transport::rate_limit::RateLimiter;
 use metrics::{counter, gauge, histogram};
 use tracing::instrument;
 
-/// Try each address in `addrs` until one succeeds, falling back on transport errors (S19).
+/// Delay before starting the next address attempt (Happy Eyeballs style).
+const ADDR_STAGGER: Duration = Duration::from_millis(300);
+
+/// Try addresses in `addrs` with staggered parallel racing (Happy Eyeballs style).
+///
+/// Launches the first address immediately, then starts each subsequent address
+/// after a 300ms delay. The first successful response wins and all other
+/// in-flight attempts are dropped.
 async fn send_request_any<T: Transport>(
     transport: &T,
     addrs: &[SocketAddr],
     msg: &Message,
 ) -> Result<Message, TesseraError> {
-    let mut last_err = TesseraError::Network("no addresses to try".into());
     tracing::debug!(
         "send_request_any: trying {} addr(s) {:?} for msg_id={}",
         addrs.len(),
         addrs,
         msg.msg_id
     );
-    for addr in addrs {
-        match transport.send_request(addr, msg.clone()).await {
-            Ok(resp) => {
-                tracing::debug!(
-                    "send_request_any: success to {} msg_id={}",
-                    addr,
-                    msg.msg_id
-                );
-                return Ok(resp);
+    if addrs.is_empty() {
+        return Err(TesseraError::Network("no addresses to try".into()));
+    }
+    if addrs.len() == 1 {
+        return transport.send_request(&addrs[0], msg.clone()).await;
+    }
+
+    // Stagger: launch first addr immediately, rest after i*300ms each.
+    let mut futs = FuturesUnordered::new();
+    let mut pending = addrs.iter().enumerate().peekable();
+
+    // Launch first immediately
+    let (_, first) = pending.next().unwrap();
+    futs.push(Box::pin(transport.send_request(first, msg.clone())));
+
+    let mut last_err = TesseraError::Network("no addresses to try".into());
+    loop {
+        if futs.is_empty() && pending.peek().is_none() {
+            return Err(last_err);
+        }
+
+        tokio::select! {
+            Some(result) = futs.next() => {
+                match result {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => { last_err = e; }
+                }
             }
-            Err(e) => {
-                tracing::debug!(
-                    "send_request_any: failed to {} msg_id={}: {}",
-                    addr,
-                    msg.msg_id,
-                    e
-                );
-                last_err = e;
+            _ = sleep(ADDR_STAGGER), if pending.peek().is_some() => {
+                let (_, addr) = pending.next().unwrap();
+                futs.push(Box::pin(transport.send_request(addr, msg.clone())));
             }
         }
     }
-    Err(last_err)
 }
 
 /// Proactively replicate locally-stored chunks to a newly discovered node,
@@ -249,10 +270,27 @@ enum Command {
         config: ErasureConfig,
         reply: oneshot::Sender<Result<StoreTesseraResult, TesseraError>>,
     },
+    StoreTesseraWithProgress {
+        data: Vec<u8>,
+        config: ErasureConfig,
+        progress_tx: mpsc::Sender<StoreProgress>,
+        reply: oneshot::Sender<Result<StoreTesseraResult, TesseraError>>,
+    },
     RetrieveTessera {
         chunk_hashes: Vec<[u8; 32]>,
         config: ErasureConfig,
         original_len: usize,
+        block_size: usize,
+        manifest_hash: Option<[u8; 32]>,
+        reply: oneshot::Sender<Result<Vec<u8>, TesseraError>>,
+    },
+    RetrieveTesseraWithProgress {
+        chunk_hashes: Vec<[u8; 32]>,
+        config: ErasureConfig,
+        original_len: usize,
+        block_size: usize,
+        manifest_hash: Option<[u8; 32]>,
+        progress_tx: mpsc::Sender<RetrieveProgress>,
         reply: oneshot::Sender<Result<Vec<u8>, TesseraError>>,
     },
     Shutdown,
@@ -270,27 +308,110 @@ pub struct StoreTesseraResult {
     pub chunk_hashes: Vec<[u8; 32]>,
     pub config: ErasureConfig,
     pub original_len: usize,
+    /// Block size used for chunking before erasure coding.
+    /// 0 means legacy single-block encoding (no block chunking).
+    pub block_size: usize,
+    /// Hash of the manifest chunk stored on the DHT.
+    /// When present, the token is compact (~48 chars) and the manifest
+    /// must be fetched first during retrieval to obtain chunk_hashes.
+    pub manifest_hash: Option<[u8; 32]>,
+}
+
+/// Manifest stored as a chunk on the DHT, containing all metadata
+/// needed to retrieve a tessera. This allows tokens to be a fixed
+/// small size (~48 chars) regardless of the number of chunks.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TesseraManifest {
+    /// All chunk hashes (erasure-coded shards).
+    h: Vec<Vec<u8>>,
+    /// Data shards count.
+    d: usize,
+    /// Parity shards count.
+    p: usize,
+    /// Original data length in bytes.
+    l: usize,
+    /// Block size (0 = legacy single-block).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    b: usize,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
+/// Progress updates during a store operation with block chunking.
+#[derive(Debug, Clone)]
+pub enum StoreProgress {
+    /// A block is being erasure-encoded.
+    Encoding { block: usize, total_blocks: usize },
+    /// A block's chunks are being distributed to the network.
+    Distributing { block: usize, total_blocks: usize },
+    /// A block has been fully distributed.
+    BlockComplete { block: usize, total_blocks: usize },
+}
+
+/// Progress updates during a retrieve operation.
+#[derive(Debug, Clone)]
+pub enum RetrieveProgress {
+    /// A chunk is being fetched from the network.
+    Fetching { chunk: usize, total_chunks: usize },
+    /// A chunk was retrieved successfully.
+    ChunkComplete { chunk: usize, total_chunks: usize },
 }
 
 /// Compact serialization format for StoreTesseraResult tokens.
+///
+/// Two modes:
+/// - **Manifest mode** (`m` present): token contains only the manifest
+///   hash. The manifest chunk on the DHT holds chunk hashes + metadata.
+/// - **Inline mode** (`h` present): token contains all chunk hashes
+///   directly (legacy, or for single-block data).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoreTesseraResultToken {
+    /// Chunk hashes — present in inline mode, empty in manifest mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     h: Vec<Vec<u8>>,
+    /// Erasure config — only needed in inline mode.
+    #[serde(default, skip_serializing_if = "is_zero")]
     d: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
     p: usize,
+    /// Original data length — only needed in inline mode.
+    #[serde(default, skip_serializing_if = "is_zero")]
     l: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    b: usize,
+    /// Manifest hash — present in manifest mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    m: Vec<u8>,
 }
 
 impl fmt::Display for StoreTesseraResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use base64::Engine;
-        let token = StoreTesseraResultToken {
-            h: self.chunk_hashes.iter().map(|h| h.to_vec()).collect(),
-            d: self.config.data_shards(),
-            p: self.config.parity_shards(),
-            l: self.original_len,
+        let token = if let Some(mh) = &self.manifest_hash {
+            // Compact manifest token — only the manifest hash
+            StoreTesseraResultToken {
+                h: Vec::new(),
+                d: 0,
+                p: 0,
+                l: 0,
+                b: 0,
+                m: mh.to_vec(),
+            }
+        } else {
+            // Inline token — all chunk hashes embedded
+            StoreTesseraResultToken {
+                h: self.chunk_hashes.iter().map(|h| h.to_vec()).collect(),
+                d: self.config.data_shards(),
+                p: self.config.parity_shards(),
+                l: self.original_len,
+                b: self.block_size,
+                m: Vec::new(),
+            }
         };
-        let msgpack = rmp_serde::to_vec(&token).expect("msgpack serialization");
+        let msgpack =
+            rmp_serde::to_vec_named(&token).expect("msgpack serialization");
         let encoded =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&msgpack);
         f.write_str(&encoded)
@@ -311,6 +432,26 @@ impl FromStr for StoreTesseraResult {
             .map_err(|e| {
                 TesseraError::Serialization(format!("msgpack: {}", e))
             })?;
+
+        // Manifest mode: token only contains the manifest hash
+        if !token.m.is_empty() {
+            if token.m.len() != 32 {
+                return Err(TesseraError::Serialization(
+                    "manifest hash must be 32 bytes".into(),
+                ));
+            }
+            let mut manifest_hash = [0u8; 32];
+            manifest_hash.copy_from_slice(&token.m);
+            return Ok(StoreTesseraResult {
+                chunk_hashes: Vec::new(),
+                config: ErasureConfig::new(10, 4)?, // placeholder
+                original_len: 0,
+                block_size: 0,
+                manifest_hash: Some(manifest_hash),
+            });
+        }
+
+        // Inline mode: all chunk hashes in token
         let chunk_hashes: Vec<[u8; 32]> = token
             .h
             .into_iter()
@@ -330,6 +471,8 @@ impl FromStr for StoreTesseraResult {
             chunk_hashes,
             config,
             original_len: token.l,
+            block_size: token.b,
+            manifest_hash: None,
         })
     }
 }
@@ -471,6 +614,29 @@ impl NodeHandle {
         .await
     }
 
+    /// Store data with progress reporting via an `mpsc::Sender`.
+    ///
+    /// The caller creates the channel and drives the receiver side for
+    /// live progress updates during encoding and distribution.
+    pub async fn store_with_progress(
+        &self,
+        data: impl AsRef<[u8]>,
+        progress_tx: mpsc::Sender<StoreProgress>,
+    ) -> Result<StoreTesseraResult, TesseraError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::StoreTesseraWithProgress {
+                data: data.as_ref().to_vec(),
+                config: self.erasure_config.clone(),
+                progress_tx,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?;
+        rx.await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?
+    }
+
     /// Erasure-encode data with an explicit [`ErasureConfig`].
     #[instrument(skip(self, data), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), data_len = data.len(), data_shards = config.data_shards(), parity_shards = config.parity_shards()))]
     pub async fn store_with_config(
@@ -512,6 +678,29 @@ impl NodeHandle {
             .await
     }
 
+    /// Retrieve data with progress reporting via an `mpsc::Sender`.
+    pub async fn retrieve_with_progress(
+        &self,
+        result: &StoreTesseraResult,
+        progress_tx: mpsc::Sender<RetrieveProgress>,
+    ) -> Result<Vec<u8>, TesseraError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::RetrieveTesseraWithProgress {
+                chunk_hashes: result.chunk_hashes.clone(),
+                config: result.config.clone(),
+                original_len: result.original_len,
+                block_size: result.block_size,
+                manifest_hash: result.manifest_hash,
+                progress_tx,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?;
+        rx.await
+            .map_err(|_| TesseraError::Network("node stopped".into()))?
+    }
+
     /// Retrieve and reconstruct data with an explicit [`ErasureConfig`] override.
     #[instrument(skip(self, result), fields(node_id = %hex::encode(&self.node_id.as_bytes()[..4]), num_chunks = result.chunk_hashes.len(), original_len = result.original_len))]
     pub async fn retrieve_with_config(
@@ -525,6 +714,8 @@ impl NodeHandle {
                 chunk_hashes: result.chunk_hashes.clone(),
                 config,
                 original_len: result.original_len,
+                block_size: result.block_size,
+                manifest_hash: result.manifest_hash,
                 reply: tx,
             })
             .await
@@ -549,6 +740,25 @@ pub enum BootstrapSource {
     Addrs(Vec<SocketAddr>),
     /// DNS SRV lookup on `_tesseras._udp.<domain>`.
     Dns(String),
+}
+
+/// Progress updates emitted during [`NodeBuilder::spawn`].
+#[derive(Clone, Debug)]
+pub enum SpawnProgress {
+    /// Loading identity from storage.
+    LoadingIdentity,
+    /// Generating proof-of-work (first run only).
+    GeneratingPow,
+    /// Binding QUIC transport to the given address.
+    BindingTransport { addr: SocketAddr },
+    /// Spawning the node actor.
+    SpawningNode,
+    /// Resolving bootstrap peers via DNS SRV.
+    ResolvingBootstrap { domain: String },
+    /// Connecting to bootstrap peers.
+    ConnectingBootstrap { count: usize },
+    /// Starting mDNS LAN discovery.
+    StartingMdns,
 }
 
 /// High-level builder for spawning a Tessera DHT node.
@@ -581,6 +791,7 @@ pub struct NodeBuilder {
     keypair: Option<(Keypair, PowProof)>,
     bootstrap_sources: Vec<BootstrapSource>,
     mdns: bool,
+    progress_fn: Option<Box<dyn Fn(SpawnProgress) + Send + 'static>>,
 }
 
 impl NodeBuilder {
@@ -599,6 +810,7 @@ impl NodeBuilder {
             keypair: None,
             bootstrap_sources: Vec::new(),
             mdns: true,
+            progress_fn: None,
         }
     }
 
@@ -656,6 +868,17 @@ impl NodeBuilder {
         self
     }
 
+    /// Set a callback for spawn progress updates.
+    ///
+    /// The callback is invoked before each step during [`Self::spawn`].
+    pub fn on_spawn_progress<F>(mut self, f: F) -> Self
+    where
+        F: Fn(SpawnProgress) + Send + 'static,
+    {
+        self.progress_fn = Some(Box::new(f));
+        self
+    }
+
     /// Spawn the node, returning a [`NodeHandle`].
     ///
     /// This will:
@@ -668,6 +891,13 @@ impl NodeBuilder {
     pub async fn spawn(self) -> Result<NodeHandle, TesseraError> {
         use crate::transport::quic::QuicTransport;
 
+        let progress_fn = self.progress_fn;
+        let progress = |step: SpawnProgress| {
+            if let Some(ref f) = progress_fn {
+                f(step);
+            }
+        };
+
         std::fs::create_dir_all(&self.data_dir)?;
 
         let metadata = MetadataStore::open(&self.data_dir.join("metadata.db"))?;
@@ -675,6 +905,7 @@ impl NodeBuilder {
             ChunkStore::new(&self.data_dir.join("chunks"), self.max_storage)?;
 
         // Load or generate identity
+        progress(SpawnProgress::LoadingIdentity);
         let (keypair, pow) = if let Some(kp) = self.keypair {
             kp
         } else {
@@ -685,6 +916,7 @@ impl NodeBuilder {
                     (kp, pow)
                 }
                 _ => {
+                    progress(SpawnProgress::GeneratingPow);
                     let kp = Keypair::generate();
                     let difficulty = self.pow_difficulty;
                     let pub_key = kp.public_key_bytes();
@@ -707,12 +939,14 @@ impl NodeBuilder {
 
         let bind_addr =
             self.bind_addr.unwrap_or_else(|| "[::]:0".parse().unwrap());
+        progress(SpawnProgress::BindingTransport { addr: bind_addr });
         let transport = Arc::new(QuicTransport::new(bind_addr).await?);
 
         let mut config = self.config;
         config.min_pow_difficulty = self.pow_difficulty;
         config.erasure_config = self.erasure_config;
 
+        progress(SpawnProgress::SpawningNode);
         let handle =
             spawn_node(keypair, pow, transport, metadata, chunks, config).await;
 
@@ -724,6 +958,9 @@ impl NodeBuilder {
                     all_addrs.extend_from_slice(addrs);
                 }
                 BootstrapSource::Dns(domain) => {
+                    progress(SpawnProgress::ResolvingBootstrap {
+                        domain: domain.clone(),
+                    });
                     match crate::transport::dns_bootstrap::resolve_bootstrap(
                         domain,
                     )
@@ -742,11 +979,15 @@ impl NodeBuilder {
             }
         }
         if !all_addrs.is_empty() {
+            progress(SpawnProgress::ConnectingBootstrap {
+                count: all_addrs.len(),
+            });
             handle.bootstrap(all_addrs).await?;
         }
 
         // Start mDNS discovery
         if self.mdns {
+            progress(SpawnProgress::StartingMdns);
             let local_addr = handle.local_addr();
             let port = local_addr.port();
             let local_ip = local_addr.ip();
@@ -1062,11 +1303,22 @@ impl<T: Transport> HandlerContext<T> {
         &self,
         addrs: Vec<SocketAddr>,
     ) -> Result<(), TesseraError> {
-        // Ping each bootstrap node to learn their identity
-        for addr in &addrs {
-            let mut msg = self.new_message(Payload::PingRequest);
-            msg.sign(&self.keypair);
-            match self.transport.send_request(addr, msg).await {
+        // Ping all bootstrap nodes concurrently to avoid sequential
+        // timeouts when some peers are unreachable.
+        let ping_futures: Vec<_> = addrs
+            .iter()
+            .map(|addr| {
+                let mut msg = self.new_message(Payload::PingRequest);
+                msg.sign(&self.keypair);
+                let transport = self.transport.clone();
+                let addr = *addr;
+                async move { (addr, transport.send_request(&addr, msg).await) }
+            })
+            .collect();
+        let results = futures::future::join_all(ping_futures).await;
+
+        for (addr, result) in &results {
+            match result {
                 Ok(resp) => {
                     // Extract observed address for NAT traversal
                     if let Payload::PingResponse {
@@ -1104,18 +1356,36 @@ impl<T: Transport> HandlerContext<T> {
         gauge!(crate::metrics::ROUTING_TABLE_SIZE).set(rt_size as f64);
 
         if self.config.client_mode {
-            // Client mode: do a single FindNodeRequest to each bootstrap peer
-            // to discover nearby nodes without a full iterative lookup (which
-            // would contact dead ephemeral peers and cause long timeouts).
-            for addr in &addrs {
-                let mut msg = self.new_message(Payload::FindNodeRequest {
-                    target: *self.node_id.as_bytes(),
-                });
-                msg.sign(&self.keypair);
-                if let Ok(resp) = self.transport.send_request(addr, msg).await
+            // Client mode: send FindNodeRequest to all bootstrap peers
+            // concurrently to discover nearby nodes without a full
+            // iterative lookup (which would contact dead ephemeral
+            // peers and cause long timeouts).
+            let live_addrs: Vec<SocketAddr> = results
+                .iter()
+                .filter_map(|(addr, r)| r.as_ref().ok().map(|_| *addr))
+                .collect();
+            let find_futures: Vec<_> = live_addrs
+                .iter()
+                .map(|addr| {
+                    let mut msg =
+                        self.new_message(Payload::FindNodeRequest {
+                            target: *self.node_id.as_bytes(),
+                        });
+                    msg.sign(&self.keypair);
+                    let transport = self.transport.clone();
+                    let addr = *addr;
+                    async move {
+                        (addr, transport.send_request(&addr, msg).await)
+                    }
+                })
+                .collect();
+            let find_results =
+                futures::future::join_all(find_futures).await;
+            let mut rt = self.routing_table.lock().await;
+            for (_, result) in find_results {
+                if let Ok(resp) = result
                     && let Payload::FindNodeResponse { nodes } = resp.payload
                 {
-                    let mut rt = self.routing_table.lock().await;
                     for n in nodes {
                         let info = NodeInfo::new(
                             NodeId::from_bytes(n.node_id),
@@ -1473,17 +1743,58 @@ impl<T: Transport> NodeActor<T> {
                 config,
                 reply,
             } => {
-                let result = self.do_store_tessera(data, config).await;
+                let result = self.do_store_tessera(data, config, None).await;
+                let _ = reply.send(result);
+            }
+            Command::StoreTesseraWithProgress {
+                data,
+                config,
+                progress_tx,
+                reply,
+            } => {
+                let result = self
+                    .do_store_tessera(data, config, Some(progress_tx))
+                    .await;
                 let _ = reply.send(result);
             }
             Command::RetrieveTessera {
                 chunk_hashes,
                 config,
                 original_len,
+                block_size,
+                manifest_hash,
                 reply,
             } => {
                 let result = self
-                    .do_retrieve_tessera(chunk_hashes, config, original_len)
+                    .do_retrieve_tessera(
+                        chunk_hashes,
+                        config,
+                        original_len,
+                        block_size,
+                        manifest_hash,
+                        None,
+                    )
+                    .await;
+                let _ = reply.send(result);
+            }
+            Command::RetrieveTesseraWithProgress {
+                chunk_hashes,
+                config,
+                original_len,
+                block_size,
+                manifest_hash,
+                progress_tx,
+                reply,
+            } => {
+                let result = self
+                    .do_retrieve_tessera(
+                        chunk_hashes,
+                        config,
+                        original_len,
+                        block_size,
+                        manifest_hash,
+                        Some(progress_tx),
+                    )
                     .await;
                 let _ = reply.send(result);
             }
@@ -1994,12 +2305,21 @@ impl<T: Transport> NodeActor<T> {
         &self,
         data: Vec<u8>,
         config: ErasureConfig,
+        progress_tx: Option<mpsc::Sender<StoreProgress>>,
     ) -> Result<StoreTesseraResult, TesseraError> {
         let start = std::time::Instant::now();
         let announce_addr = self.best_addr().await;
+        let original_len = data.len();
+        let block_size = erasure::DEFAULT_BLOCK_SIZE;
+        let num_blocks = if data.is_empty() {
+            1
+        } else {
+            data.len().div_ceil(block_size)
+        };
         tracing::info!(
-            "do_store_tessera: data_len={} announce_addr={} config={:?}",
+            "do_store_tessera: data_len={} blocks={} announce_addr={} config={:?}",
             data.len(),
+            num_blocks,
             announce_addr,
             config
         );
@@ -2022,195 +2342,297 @@ impl<T: Transport> NodeActor<T> {
             }
         }
 
-        let encoded = erasure::encode(&data, &config)?;
-        tracing::info!(
-            "do_store_tessera: encoded into {} chunks",
-            encoded.chunk_hashes.len()
-        );
-
-        // Store chunks locally first
-        for (hash, chunk_data) in
-            encoded.chunk_hashes.iter().zip(encoded.chunks.iter())
-        {
-            self.chunks.put(hash, chunk_data).await?;
-        }
+        // Spawn encoder on blocking thread — Reed-Solomon is CPU-bound.
+        // Channel buffer of 1 provides natural backpressure (encode 1 ahead).
+        let (enc_tx, mut enc_rx) =
+            mpsc::channel::<(usize, erasure::EncodedTessera)>(1);
+        let enc_config = config.clone();
+        let progress_tx_enc = progress_tx.clone();
+        let encoder_handle = tokio::task::spawn_blocking(move || {
+            for i in 0..num_blocks {
+                if let Some(ref ptx) = progress_tx_enc {
+                    let _ = ptx.blocking_send(StoreProgress::Encoding {
+                        block: i,
+                        total_blocks: num_blocks,
+                    });
+                }
+                let block_start = i * block_size;
+                let block_end = ((i + 1) * block_size).min(data.len());
+                let block_data = if block_start < data.len() {
+                    &data[block_start..block_end]
+                } else {
+                    &[]
+                };
+                let encoded = erasure::encode(block_data, &enc_config)?;
+                // If receiver dropped, store was cancelled
+                if enc_tx.blocking_send((i, encoded)).is_err() {
+                    return Err(TesseraError::Network(
+                        "store cancelled".into(),
+                    ));
+                }
+            }
+            Ok::<(), TesseraError>(())
+        });
 
         // Shared semaphore caps total concurrent outbound RPCs at alpha
         let sem = Arc::new(Semaphore::new(self.config.alpha));
-        // Track (node_id, JoinHandle) so we can record_failure on errors
         let mut distribution_handles: Vec<(
             NodeId,
             tokio::task::JoinHandle<Result<Message, TesseraError>>,
         )> = Vec::new();
-
-        // Peers that failed during this store — shared with spawned tasks so they
-        // can bail out early instead of wasting a semaphore permit + 5s timeout.
         let failed_peers: Arc<std::sync::Mutex<HashSet<NodeId>>> =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mut all_chunk_hashes: Vec<[u8; 32]> = Vec::new();
 
-        // Distribute chunks to closest nodes for each chunk hash
-        for (hash, chunk_data) in
-            encoded.chunk_hashes.iter().zip(encoded.chunks.iter())
-        {
-            let target = NodeId::from_bytes(*hash);
-            let closest = self
-                .routing_table
-                .lock()
-                .await
-                .closest_nodes(&target, self.config.k);
+        // Distributor loop — overlaps with encoding
+        while let Some((block_idx, encoded)) = enc_rx.recv().await {
+            if let Some(ref ptx) = progress_tx {
+                let _ = ptx
+                    .send(StoreProgress::Distributing {
+                        block: block_idx,
+                        total_blocks: num_blocks,
+                    })
+                    .await;
+            }
 
             tracing::info!(
-                "do_store_tessera: chunk {} -> {} closest peers (taking alpha={})",
-                hex::encode(&hash[..4]),
-                closest.len(),
-                self.config.alpha
+                "do_store_tessera: block {} encoded into {} chunks",
+                block_idx,
+                encoded.chunk_hashes.len()
             );
 
-            let mut sent = 0;
-            for node in &closest {
-                if sent >= self.config.alpha {
-                    break;
-                }
-                if node.addresses.is_empty() || node.node_id == self.node_id {
-                    continue;
-                }
-                // Skip peers already known to be unreachable
-                if failed_peers
+            // Store chunks locally first
+            for (hash, chunk_data) in
+                encoded.chunk_hashes.iter().zip(encoded.chunks.iter())
+            {
+                self.chunks.put(hash, chunk_data).await?;
+            }
+
+            // Distribute chunks to closest nodes for each chunk hash
+            for (hash, chunk_data) in
+                encoded.chunk_hashes.iter().zip(encoded.chunks.iter())
+            {
+                let target = NodeId::from_bytes(*hash);
+                let closest = self
+                    .routing_table
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(&node.node_id)
-                {
-                    tracing::debug!(
-                        "do_store_tessera: skipping failed peer node_id={}",
-                        hex::encode(&node.node_id.as_bytes()[..4]),
-                    );
-                    continue;
-                }
+                    .await
+                    .closest_nodes(&target, self.config.k);
+
                 tracing::info!(
-                    "do_store_tessera: PutChunk {} -> node_id={} addrs={:?}",
+                    "do_store_tessera: chunk {} -> {} closest peers (taking alpha={})",
                     hex::encode(&hash[..4]),
-                    hex::encode(&node.node_id.as_bytes()[..4]),
-                    node.addresses
+                    closest.len(),
+                    self.config.alpha
                 );
-                let mut msg = self.new_message(Payload::PutChunkRequest {
-                    chunk_hash: *hash,
-                    data: chunk_data.clone(),
-                });
-                msg.sign(&self.keypair);
-                let transport = self.transport.clone();
-                let addrs = node.addresses.clone();
-                let sem = sem.clone();
-                let fp = failed_peers.clone();
-                let peer_id = node.node_id;
-                distribution_handles.push((
-                    peer_id,
-                    tokio::spawn(async move {
-                        // Check again before acquiring permit (peer may have
-                        // failed while we were queued)
-                        if fp
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .contains(&peer_id)
-                        {
-                            return Err(TesseraError::Network(
-                                "peer marked as failed".into(),
-                            ));
-                        }
-                        let _permit = sem.acquire_owned().await;
-                        send_request_any(&*transport, &addrs, &msg).await
-                    }),
-                ));
-                sent += 1;
+
+                let mut sent = 0;
+                for node in &closest {
+                    if sent >= self.config.alpha {
+                        break;
+                    }
+                    if node.addresses.is_empty() || node.node_id == self.node_id
+                    {
+                        continue;
+                    }
+                    if failed_peers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&node.node_id)
+                    {
+                        tracing::debug!(
+                            "do_store_tessera: skipping failed peer node_id={}",
+                            hex::encode(&node.node_id.as_bytes()[..4]),
+                        );
+                        continue;
+                    }
+                    tracing::info!(
+                        "do_store_tessera: PutChunk {} -> node_id={} addrs={:?}",
+                        hex::encode(&hash[..4]),
+                        hex::encode(&node.node_id.as_bytes()[..4]),
+                        node.addresses
+                    );
+                    let mut msg = self.new_message(Payload::PutChunkRequest {
+                        chunk_hash: *hash,
+                        data: chunk_data.clone(),
+                    });
+                    msg.sign(&self.keypair);
+                    let transport = self.transport.clone();
+                    let addrs = node.addresses.clone();
+                    let sem = sem.clone();
+                    let fp = failed_peers.clone();
+                    let peer_id = node.node_id;
+                    distribution_handles.push((
+                        peer_id,
+                        tokio::spawn(async move {
+                            if fp
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .contains(&peer_id)
+                            {
+                                return Err(TesseraError::Network(
+                                    "peer marked as failed".into(),
+                                ));
+                            }
+                            let _permit = sem.acquire_owned().await;
+                            send_request_any(&*transport, &addrs, &msg).await
+                        }),
+                    ));
+                    sent += 1;
+                }
+
+                // Also add ourselves as a provider
+                let content_key = *hash;
+                let metadata = self.metadata.clone();
+                let node_id = *self.node_id.as_bytes();
+                let public_key = self.keypair.public_key_bytes();
+                let local_addr = announce_addr;
+                let provider_ttl = self.config.provider_ttl;
+                let _ = tokio::task::spawn_blocking(move || {
+                    metadata
+                        .lock()
+                        .map_err(|_| {
+                            TesseraError::Network(
+                                "metadata lock poisoned".into(),
+                            )
+                        })?
+                        .add_provider(
+                            &content_key,
+                            &node_id,
+                            &public_key,
+                            &[local_addr],
+                            provider_ttl,
+                        )
+                })
+                .await;
             }
 
-            // Also add ourselves as a provider
-            let content_key = *hash;
-            let metadata = self.metadata.clone();
-            let node_id = *self.node_id.as_bytes();
-            let public_key = self.keypair.public_key_bytes();
-            let local_addr = announce_addr;
-            let provider_ttl = self.config.provider_ttl;
-            let _ = tokio::task::spawn_blocking(move || {
-                metadata
+            // Announce as provider for each chunk
+            for hash in &encoded.chunk_hashes {
+                let target = NodeId::from_bytes(*hash);
+                let closest_to_chunk = self
+                    .routing_table
                     .lock()
-                    .map_err(|_| {
-                        TesseraError::Network("metadata lock poisoned".into())
-                    })?
-                    .add_provider(
-                        &content_key,
-                        &node_id,
-                        &public_key,
-                        &[local_addr],
-                        provider_ttl,
-                    )
-            })
-            .await;
-        }
+                    .await
+                    .closest_nodes(&target, self.config.k);
+                let mut sent = 0;
+                for node in &closest_to_chunk {
+                    if sent >= self.config.alpha {
+                        break;
+                    }
+                    if node.addresses.is_empty() || node.node_id == self.node_id
+                    {
+                        continue;
+                    }
+                    if failed_peers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&node.node_id)
+                    {
+                        continue;
+                    }
+                    let mut msg =
+                        self.new_message(Payload::AddProviderRequest {
+                            key: *hash,
+                            addresses: vec![announce_addr],
+                        });
+                    msg.sign(&self.keypair);
+                    let transport = self.transport.clone();
+                    let addrs = node.addresses.clone();
+                    let sem = sem.clone();
+                    let fp = failed_peers.clone();
+                    let peer_id = node.node_id;
+                    distribution_handles.push((
+                        peer_id,
+                        tokio::spawn(async move {
+                            if fp
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .contains(&peer_id)
+                            {
+                                return Err(TesseraError::Network(
+                                    "peer marked as failed".into(),
+                                ));
+                            }
+                            let _permit = sem.acquire_owned().await;
+                            send_request_any(&*transport, &addrs, &msg).await
+                        }),
+                    ));
+                    sent += 1;
+                }
+            }
 
-        // Announce as provider for each chunk — target nodes closest to the chunk hash
-        for hash in &encoded.chunk_hashes {
-            let target = NodeId::from_bytes(*hash);
-            let closest_to_chunk = self
-                .routing_table
-                .lock()
-                .await
-                .closest_nodes(&target, self.config.k);
-            let mut sent = 0;
-            for node in &closest_to_chunk {
-                if sent >= self.config.alpha {
-                    break;
-                }
-                if node.addresses.is_empty() || node.node_id == self.node_id {
-                    continue;
-                }
-                if failed_peers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(&node.node_id)
-                {
-                    continue;
-                }
-                let mut msg = self.new_message(Payload::AddProviderRequest {
-                    key: *hash,
-                    addresses: vec![announce_addr],
-                });
-                msg.sign(&self.keypair);
-                let transport = self.transport.clone();
-                let addrs = node.addresses.clone();
-                let sem = sem.clone();
-                let fp = failed_peers.clone();
-                let peer_id = node.node_id;
-                distribution_handles.push((
-                    peer_id,
-                    tokio::spawn(async move {
-                        if fp
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .contains(&peer_id)
-                        {
-                            return Err(TesseraError::Network(
-                                "peer marked as failed".into(),
-                            ));
-                        }
-                        let _permit = sem.acquire_owned().await;
-                        send_request_any(&*transport, &addrs, &msg).await
-                    }),
-                ));
-                sent += 1;
+            all_chunk_hashes.extend_from_slice(&encoded.chunk_hashes);
+
+            if let Some(ref ptx) = progress_tx {
+                let _ = ptx
+                    .send(StoreProgress::BlockComplete {
+                        block: block_idx,
+                        total_blocks: num_blocks,
+                    })
+                    .await;
             }
         }
 
-        // Await distribution with per-handle timeout; record failures for dead peers.
-        // IMPORTANT: abort the task on timeout to release the semaphore permit.
-        // Without abort, timed-out tasks keep running (holding the permit) until
-        // the inner send_request completes (up to 30s), starving other tasks.
+        // Await encoder task completion
+        match encoder_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(TesseraError::ErasureCoding(format!(
+                    "encoder panicked: {}",
+                    e
+                )));
+            }
+        }
+
+        // Await ALL distribution handles concurrently, each with a 5s timeout.
         let total = distribution_handles.len();
+        let results: Vec<(NodeId, Result<Result<Message, TesseraError>, _>)> =
+            futures::future::join_all(distribution_handles.into_iter().map(
+                |(peer_id, handle)| {
+                    let abort_handle = handle.abort_handle();
+                    async move {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            handle,
+                        )
+                        .await;
+                        if result.is_err() {
+                            abort_handle.abort();
+                        }
+                        let flattened = match result {
+                            Ok(Ok(inner)) => Ok(inner),
+                            Ok(Err(join_err)) => {
+                                Err(format!("task panicked: {}", join_err))
+                            }
+                            Err(_) => Err("timed out (5s)".into()),
+                        };
+                        (peer_id, flattened)
+                    }
+                },
+            ))
+            .await;
+
         let mut succeeded = 0usize;
-        for (peer_id, handle) in distribution_handles {
-            let abort_handle = handle.abort_handle();
-            match tokio::time::timeout(Duration::from_secs(5), handle).await {
-                Ok(Ok(Ok(_))) => succeeded += 1,
-                Ok(Ok(Err(e))) => {
+        for (peer_id, result) in results {
+            match result {
+                Ok(Ok(resp)) => {
+                    if let Payload::PutChunkResponse { ok: true } = resp.payload
+                    {
+                        succeeded += 1;
+                    } else {
+                        tracing::warn!(
+                            "store: PutChunk rejected by {}",
+                            hex::encode(&peer_id.as_bytes()[..8]),
+                        );
+                        failed_peers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(peer_id);
+                    }
+                }
+                Ok(Err(e)) => {
                     let msg = e.to_string();
                     if msg.contains("peer marked as failed") {
                         // Already counted in failed_peers, no action needed
@@ -2230,14 +2652,11 @@ impl<T: Transport> NodeActor<T> {
                             .record_failure(&peer_id, self.config.max_failures);
                     }
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!("store: distribution task panicked: {}", e)
-                }
-                Err(_) => {
-                    abort_handle.abort();
+                Err(reason) => {
                     tracing::warn!(
-                        "store: distribution RPC to {} timed out (5s)",
+                        "store: distribution RPC to {} {}",
                         hex::encode(&peer_id.as_bytes()[..8]),
+                        reason,
                     );
                     failed_peers
                         .lock()
@@ -2250,10 +2669,8 @@ impl<T: Transport> NodeActor<T> {
                 }
             }
         }
-        let failed_count = failed_peers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len();
+        let failed_count =
+            failed_peers.lock().unwrap_or_else(|e| e.into_inner()).len();
         tracing::info!(
             "store: {}/{} RPCs succeeded, {} failed peers skipped, {:.1}s elapsed",
             succeeded,
@@ -2265,22 +2682,178 @@ impl<T: Transport> NodeActor<T> {
         counter!(crate::metrics::STORE_TOTAL, crate::metrics::LABEL_STATUS => "ok").increment(1);
         histogram!(crate::metrics::STORE_DURATION_SECONDS)
             .record(start.elapsed().as_secs_f64());
+
+        // Create and store a manifest chunk so the token stays compact.
+        let manifest = TesseraManifest {
+            h: all_chunk_hashes.iter().map(|h| h.to_vec()).collect(),
+            d: config.data_shards(),
+            p: config.parity_shards(),
+            l: original_len,
+            b: block_size,
+        };
+        let manifest_bytes =
+            rmp_serde::to_vec(&manifest).expect("manifest serialization");
+        let manifest_hash: [u8; 32] = {
+            use sha2::Digest;
+            sha2::Sha256::digest(&manifest_bytes).into()
+        };
+
+        // Store manifest locally
+        self.chunks.put(&manifest_hash, &manifest_bytes).await?;
+
+        // Distribute manifest to closest nodes
+        let manifest_target = NodeId::from_bytes(manifest_hash);
+        let closest_manifest = self
+            .routing_table
+            .lock()
+            .await
+            .closest_nodes(&manifest_target, self.config.k);
+        for node in &closest_manifest {
+            if node.addresses.is_empty() || node.node_id == self.node_id {
+                continue;
+            }
+            let mut msg = self.new_message(Payload::PutChunkRequest {
+                chunk_hash: manifest_hash,
+                data: manifest_bytes.clone(),
+            });
+            msg.sign(&self.keypair);
+            let transport = self.transport.clone();
+            let addrs = node.addresses.clone();
+            tokio::spawn(async move {
+                let _ = send_request_any(&*transport, &addrs, &msg).await;
+            });
+        }
+        // Announce as provider for the manifest hash
+        for node in &closest_manifest {
+            if node.addresses.is_empty() || node.node_id == self.node_id {
+                continue;
+            }
+            let mut msg = self.new_message(Payload::AddProviderRequest {
+                key: manifest_hash,
+                addresses: vec![announce_addr],
+            });
+            msg.sign(&self.keypair);
+            let transport = self.transport.clone();
+            let addrs = node.addresses.clone();
+            tokio::spawn(async move {
+                let _ = send_request_any(&*transport, &addrs, &msg).await;
+            });
+        }
+        tracing::info!(
+            "store: manifest hash={} ({} bytes) distributed",
+            hex::encode(&manifest_hash[..8]),
+            manifest_bytes.len()
+        );
+
         Ok(StoreTesseraResult {
-            chunk_hashes: encoded.chunk_hashes,
-            config: encoded.config,
-            original_len: encoded.original_len,
+            chunk_hashes: all_chunk_hashes,
+            config,
+            original_len,
+            block_size,
+            manifest_hash: Some(manifest_hash),
         })
     }
 
     // --- Retrieve Tessera ---
 
-    #[instrument(skip(self, chunk_hashes), fields(num_chunks = chunk_hashes.len()))]
+    #[instrument(skip(self, chunk_hashes, manifest_hash), fields(num_chunks = chunk_hashes.len()))]
     async fn do_retrieve_tessera(
         &self,
-        chunk_hashes: Vec<[u8; 32]>,
-        config: ErasureConfig,
-        original_len: usize,
+        mut chunk_hashes: Vec<[u8; 32]>,
+        mut config: ErasureConfig,
+        mut original_len: usize,
+        mut block_size: usize,
+        manifest_hash: Option<[u8; 32]>,
+        progress_tx: Option<mpsc::Sender<RetrieveProgress>>,
     ) -> Result<Vec<u8>, TesseraError> {
+        // If we have a manifest hash and no inline chunk hashes,
+        // resolve the manifest first to get the actual chunk hashes.
+        if let Some(mh) = manifest_hash
+            && chunk_hashes.is_empty()
+        {
+            tracing::info!(
+                "retrieve: resolving manifest {}",
+                hex::encode(&mh[..8])
+            );
+            // Try local first, then do iterative lookup + fetch
+            let manifest_data = if let Ok(Some(data)) =
+                self.chunks.get(&mh).await
+            {
+                data
+            } else {
+                // Iterative find_node to converge on the actual closest
+                // nodes to the manifest hash before fetching.
+                let target = NodeId::from_bytes(mh);
+                let _ = self.do_iterative_find_node(target).await;
+
+                let closest = self
+                    .routing_table
+                    .lock()
+                    .await
+                    .closest_nodes(&target, self.config.k);
+                let (mtx, mut mrx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+                let mut handles = Vec::new();
+                for node in closest.iter().take(self.config.k) {
+                    if node.addresses.is_empty() || node.node_id == self.node_id
+                    {
+                        continue;
+                    }
+                    let mut msg = self.new_message(Payload::GetChunkRequest {
+                        chunk_hash: mh,
+                    });
+                    msg.sign(&self.keypair);
+                    let transport = self.transport.clone();
+                    let addrs = node.addresses.clone();
+                    let mtx = mtx.clone();
+                    handles.push(tokio::spawn(async move {
+                        if let Ok(resp) =
+                            send_request_any(&*transport, &addrs, &msg).await
+                            && let Payload::GetChunkResponse { data } =
+                                resp.payload
+                            && !data.is_empty()
+                            && ChunkStore::hash(&data) == mh
+                        {
+                            let _ = mtx.send(data).await;
+                        }
+                    }));
+                }
+                drop(mtx);
+                let data = mrx.recv().await;
+                for h in &handles {
+                    h.abort();
+                }
+                data.ok_or_else(|| {
+                    TesseraError::Network("manifest chunk not found".into())
+                })?
+            };
+            let manifest: TesseraManifest =
+                rmp_serde::from_slice(&manifest_data).map_err(|e| {
+                    TesseraError::Serialization(format!("manifest: {}", e))
+                })?;
+            chunk_hashes = manifest
+                .h
+                .into_iter()
+                .map(|v| {
+                    let mut arr = [0u8; 32];
+                    if v.len() != 32 {
+                        return Err(TesseraError::Serialization(
+                            "chunk hash must be 32 bytes".into(),
+                        ));
+                    }
+                    arr.copy_from_slice(&v);
+                    Ok(arr)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            config = ErasureConfig::new(manifest.d, manifest.p)?;
+            original_len = manifest.l;
+            block_size = manifest.b;
+            tracing::info!(
+                "retrieve: manifest resolved, {} chunks, original_len={}",
+                chunk_hashes.len(),
+                original_len
+            );
+        }
+
         // Global timeout to prevent unbounded blocking when all peers are slow
         const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(120);
         match tokio::time::timeout(
@@ -2289,6 +2862,8 @@ impl<T: Transport> NodeActor<T> {
                 &chunk_hashes,
                 &config,
                 original_len,
+                block_size,
+                progress_tx,
             ),
         )
         .await
@@ -2303,15 +2878,34 @@ impl<T: Transport> NodeActor<T> {
         chunk_hashes: &[[u8; 32]],
         config: &ErasureConfig,
         original_len: usize,
+        block_size: usize,
+        progress_tx: Option<mpsc::Sender<RetrieveProgress>>,
     ) -> Result<Vec<u8>, TesseraError> {
         let start = std::time::Instant::now();
-        let mut shards: Vec<Option<Vec<u8>>> =
-            Vec::with_capacity(chunk_hashes.len());
+        let total_chunks = chunk_hashes.len();
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_chunks);
 
-        for hash in chunk_hashes {
+        for (chunk_idx, hash) in chunk_hashes.iter().enumerate() {
+            if let Some(ref ptx) = progress_tx {
+                let _ = ptx
+                    .send(RetrieveProgress::Fetching {
+                        chunk: chunk_idx,
+                        total_chunks,
+                    })
+                    .await;
+            }
+
             // Try local first
             if let Ok(Some(data)) = self.chunks.get(hash).await {
                 shards.push(Some(data));
+                if let Some(ref ptx) = progress_tx {
+                    let _ = ptx
+                        .send(RetrieveProgress::ChunkComplete {
+                            chunk: chunk_idx,
+                            total_chunks,
+                        })
+                        .await;
+                }
                 continue;
             }
 
@@ -2366,10 +2960,32 @@ impl<T: Transport> NodeActor<T> {
             } else {
                 shards.push(None);
             }
+
+            if let Some(ref ptx) = progress_tx {
+                let _ = ptx
+                    .send(RetrieveProgress::ChunkComplete {
+                        chunk: chunk_idx,
+                        total_chunks,
+                    })
+                    .await;
+            }
         }
 
-        // Decode
-        let result = erasure::decode(&mut shards, config, original_len);
+        // Decode — handle both legacy single-block and multi-block formats
+        let result = if block_size == 0 {
+            // Legacy single-block
+            erasure::decode(&mut shards, config, original_len)
+        } else {
+            let spc = config.total_shards();
+            let mut block_shards: Vec<Vec<Option<Vec<u8>>>> =
+                shards.chunks(spc).map(|c| c.to_vec()).collect();
+            erasure::decode_blocks(
+                &mut block_shards,
+                config,
+                block_size,
+                original_len,
+            )
+        };
         let status = if result.is_ok() { "ok" } else { "err" };
         counter!(crate::metrics::RETRIEVE_TOTAL, crate::metrics::LABEL_STATUS => status).increment(1);
         histogram!(crate::metrics::RETRIEVE_DURATION_SECONDS)
@@ -2803,7 +3419,9 @@ async fn handle_inbound_message<T: Transport>(
                                         from_addr,
                                         hex::encode(&target_id[..8]),
                                         node.addresses,
-                                        crate::metrics::payload_type_label(&inner_msg.payload),
+                                        crate::metrics::payload_type_label(
+                                            &inner_msg.payload
+                                        ),
                                     );
                                     match send_request_any(
                                         &*ctx.transport,
@@ -2814,7 +3432,12 @@ async fn handle_inbound_message<T: Transport>(
                                     {
                                         Ok(resp) => match resp.to_bytes() {
                                             Ok(resp_bytes) => {
-                                                tracing::info!("relay: forward succeeded to {}", hex::encode(&target_id[..8]));
+                                                tracing::info!(
+                                                    "relay: forward succeeded to {}",
+                                                    hex::encode(
+                                                        &target_id[..8]
+                                                    )
+                                                );
                                                 counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "ok").increment(1);
                                                 Payload::RelayResponse {
                                                     ok: true,
@@ -2822,7 +3445,13 @@ async fn handle_inbound_message<T: Transport>(
                                                 }
                                             }
                                             Err(e) => {
-                                                tracing::warn!("relay: forward response serialize failed to {}: {}", hex::encode(&target_id[..8]), e);
+                                                tracing::warn!(
+                                                    "relay: forward response serialize failed to {}: {}",
+                                                    hex::encode(
+                                                        &target_id[..8]
+                                                    ),
+                                                    e
+                                                );
                                                 counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "rejected").increment(1);
                                                 Payload::RelayResponse {
                                                     ok: false,
@@ -2831,7 +3460,12 @@ async fn handle_inbound_message<T: Transport>(
                                             }
                                         },
                                         Err(e) => {
-                                            tracing::warn!("relay: forward failed to {} addrs={:?}: {}", hex::encode(&target_id[..8]), node.addresses, e);
+                                            tracing::warn!(
+                                                "relay: forward failed to {} addrs={:?}: {}",
+                                                hex::encode(&target_id[..8]),
+                                                node.addresses,
+                                                e
+                                            );
                                             counter!(crate::metrics::RELAY_FORWARD_TOTAL, crate::metrics::LABEL_STATUS => "rejected").increment(1);
                                             Payload::RelayResponse {
                                                 ok: false,
@@ -3528,6 +4162,8 @@ mod tests {
             chunk_hashes: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
             config: ErasureConfig::new(2, 1).unwrap(),
             original_len: 42,
+            block_size: 0,
+            manifest_hash: None,
         };
 
         let token = result.to_string();
@@ -3537,6 +4173,46 @@ mod tests {
         assert_eq!(parsed.config.data_shards(), 2);
         assert_eq!(parsed.config.parity_shards(), 1);
         assert_eq!(parsed.original_len, 42);
+    }
+
+    #[test]
+    fn test_store_tessera_result_manifest_token_roundtrip() {
+        let result = StoreTesseraResult {
+            chunk_hashes: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+            config: ErasureConfig::new(10, 4).unwrap(),
+            original_len: 5_000_000,
+            block_size: 262144,
+            manifest_hash: Some([42u8; 32]),
+        };
+
+        let token = result.to_string();
+        // Manifest token should be much shorter than inline
+        assert!(
+            token.len() < 100,
+            "manifest token too long: {} chars",
+            token.len()
+        );
+
+        let parsed: StoreTesseraResult = token.parse().unwrap();
+        assert!(parsed.chunk_hashes.is_empty());
+        assert_eq!(parsed.manifest_hash, Some([42u8; 32]));
+    }
+
+    #[test]
+    fn test_store_tessera_result_inline_token_backward_compat() {
+        // Tokens without manifest (legacy) should still work
+        let result = StoreTesseraResult {
+            chunk_hashes: vec![[1u8; 32], [2u8; 32]],
+            config: ErasureConfig::new(2, 1).unwrap(),
+            original_len: 100,
+            block_size: 0,
+            manifest_hash: None,
+        };
+        let token = result.to_string();
+        let parsed: StoreTesseraResult = token.parse().unwrap();
+        assert_eq!(parsed.chunk_hashes.len(), 2);
+        assert!(parsed.manifest_hash.is_none());
+        assert_eq!(parsed.original_len, 100);
     }
 
     #[test]

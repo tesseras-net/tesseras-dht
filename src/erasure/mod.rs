@@ -8,6 +8,19 @@ use sha2::{Digest, Sha256};
 
 use crate::error::TesseraError;
 
+/// Default block size for chunking data before erasure coding (256 KiB).
+pub const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
+
+/// Result of encoding data in multiple blocks.
+pub struct EncodedBlocks {
+    /// One `EncodedTessera` per block.
+    pub blocks: Vec<EncodedTessera>,
+    /// Block size used for splitting.
+    pub block_size: usize,
+    /// Original total data length.
+    pub original_len: usize,
+}
+
 /// Configuration for erasure coding a tessera.
 ///
 /// Fields are private to enforce validation. Use [`ErasureConfig::new()`] or
@@ -212,6 +225,70 @@ pub fn decode(
     Ok(result)
 }
 
+/// Encode data into block-level erasure-coded chunks.
+///
+/// Splits `data` into blocks of `block_size` bytes, then erasure-encodes
+/// each block independently. For data that fits in a single block, this
+/// produces the same result as calling [`encode()`] directly.
+pub fn encode_blocks(
+    data: &[u8],
+    config: &ErasureConfig,
+    block_size: usize,
+) -> Result<EncodedBlocks, TesseraError> {
+    let original_len = data.len();
+    let num_blocks = if data.is_empty() {
+        1
+    } else {
+        data.len().div_ceil(block_size)
+    };
+
+    let mut blocks = Vec::with_capacity(num_blocks);
+    for i in 0..num_blocks {
+        let start = i * block_size;
+        let end = ((i + 1) * block_size).min(data.len());
+        let block_data = if start < data.len() {
+            &data[start..end]
+        } else {
+            &[]
+        };
+        blocks.push(encode(block_data, config)?);
+    }
+
+    Ok(EncodedBlocks {
+        blocks,
+        block_size,
+        original_len,
+    })
+}
+
+/// Decode data from block-level erasure-coded chunks.
+///
+/// `block_shards` is a vec of shard groups, one per block. Each group
+/// has `total_shards` entries. The last block may be shorter than
+/// `block_size`.
+pub fn decode_blocks(
+    block_shards: &mut [Vec<Option<Vec<u8>>>],
+    config: &ErasureConfig,
+    block_size: usize,
+    original_len: usize,
+) -> Result<Vec<u8>, TesseraError> {
+    let num_blocks = block_shards.len();
+    let mut result = Vec::with_capacity(original_len);
+
+    for (i, shards) in block_shards.iter_mut().enumerate() {
+        let block_original_len = if i == num_blocks - 1 {
+            // Last block: remaining bytes
+            original_len - (num_blocks - 1) * block_size
+        } else {
+            block_size
+        };
+        let decoded = decode(shards, config, block_original_len)?;
+        result.extend_from_slice(&decoded);
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +394,89 @@ mod tests {
         shards[11] = None;
 
         let decoded = decode(&mut shards, &config, data.len()).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    // -- Block-level encode/decode tests --
+
+    #[test]
+    fn test_encode_blocks_sub_block() {
+        // Data smaller than one block
+        let data = b"tiny data";
+        let config = ErasureConfig::new(4, 2).unwrap();
+        let encoded = encode_blocks(data, &config, 1024).unwrap();
+        assert_eq!(encoded.blocks.len(), 1);
+        assert_eq!(encoded.original_len, data.len());
+
+        // Decode
+        let mut block_shards: Vec<Vec<Option<Vec<u8>>>> = encoded
+            .blocks
+            .into_iter()
+            .map(|b| b.chunks.into_iter().map(Some).collect())
+            .collect();
+        let decoded =
+            decode_blocks(&mut block_shards, &config, 1024, data.len())
+                .unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_encode_blocks_exact_block() {
+        // Data exactly one block size
+        let data: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
+        let config = ErasureConfig::new(4, 2).unwrap();
+        let encoded = encode_blocks(&data, &config, 256).unwrap();
+        assert_eq!(encoded.blocks.len(), 1);
+
+        let mut block_shards: Vec<Vec<Option<Vec<u8>>>> = encoded
+            .blocks
+            .into_iter()
+            .map(|b| b.chunks.into_iter().map(Some).collect())
+            .collect();
+        let decoded =
+            decode_blocks(&mut block_shards, &config, 256, data.len()).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_encode_blocks_multi_block() {
+        // Data spanning 3 blocks
+        let data: Vec<u8> = (0..768).map(|i| (i % 256) as u8).collect();
+        let config = ErasureConfig::new(4, 2).unwrap();
+        let encoded = encode_blocks(&data, &config, 256).unwrap();
+        assert_eq!(encoded.blocks.len(), 3);
+
+        let mut block_shards: Vec<Vec<Option<Vec<u8>>>> = encoded
+            .blocks
+            .into_iter()
+            .map(|b| b.chunks.into_iter().map(Some).collect())
+            .collect();
+        let decoded =
+            decode_blocks(&mut block_shards, &config, 256, data.len()).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_encode_blocks_partial_last() {
+        // Data with partial last block (700 bytes, 256-byte blocks = 3 blocks, last = 188)
+        let data: Vec<u8> = (0..700).map(|i| (i % 256) as u8).collect();
+        let config = ErasureConfig::new(4, 2).unwrap();
+        let encoded = encode_blocks(&data, &config, 256).unwrap();
+        assert_eq!(encoded.blocks.len(), 3);
+
+        // Lose one shard per block (within parity tolerance)
+        let mut block_shards: Vec<Vec<Option<Vec<u8>>>> = encoded
+            .blocks
+            .into_iter()
+            .map(|b| {
+                let mut shards: Vec<Option<Vec<u8>>> =
+                    b.chunks.into_iter().map(Some).collect();
+                shards[0] = None; // lose first shard of each block
+                shards
+            })
+            .collect();
+        let decoded =
+            decode_blocks(&mut block_shards, &config, 256, data.len()).unwrap();
         assert_eq!(decoded, data);
     }
 }

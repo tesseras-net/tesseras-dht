@@ -25,6 +25,11 @@ const POOL_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 /// Keepalive interval to prevent NAT mapping expiry.
 /// Most NATs expire UDP mappings after 30-120s of inactivity.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// Proactively evict pooled connections idle longer than this threshold.
+/// Quinn's default max_idle_timeout is 30s; by evicting at 10s we avoid
+/// handing out connections that are about to (or have already) expired on
+/// the remote side, preventing 5s+ hangs on stale QUIC streams.
+const POOL_STALE_THRESHOLD: Duration = Duration::from_secs(10);
 /// Maximum wire message size: 4 MB data + 1 KB envelope overhead.
 pub(crate) const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024 + 1024;
 /// Maximum number of pending inbound response senders (prevents unbounded HashMap growth).
@@ -386,10 +391,20 @@ impl QuicTransport {
     ) -> Result<quinn::Connection, TesseraError> {
         let mut pool = self.connection_pool.lock().await;
         if let Some(entry) = pool.get_mut(addr) {
-            if entry.conn.close_reason().is_none() {
+            if entry.conn.close_reason().is_none()
+                && entry.last_used.elapsed() < POOL_STALE_THRESHOLD
+            {
                 entry.last_used = tokio::time::Instant::now();
                 counter!(crate::metrics::CONN_POOL_HIT_TOTAL).increment(1);
                 return Ok(entry.conn.clone());
+            }
+            // Connection is closed or idle too long — evict and reconnect.
+            if entry.last_used.elapsed() >= POOL_STALE_THRESHOLD {
+                tracing::debug!(
+                    "conn_pool: evicting stale connection to {} (idle {:.1}s)",
+                    addr,
+                    entry.last_used.elapsed().as_secs_f64(),
+                );
             }
             pool.remove(addr);
         }
