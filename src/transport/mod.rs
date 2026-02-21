@@ -240,7 +240,9 @@ mod tests {
                     nonce: 0,
                     difficulty: 0,
                 },
-                Payload::PingResponse,
+                Payload::PingResponse {
+                    observed_addr: None,
+                },
             );
             tb.send_response(&from_addr, resp).await.unwrap();
         });
@@ -256,7 +258,7 @@ mod tests {
             Payload::PingRequest,
         );
         let resp = transport_a.send_request(&addr_b, req).await.unwrap();
-        assert!(matches!(resp.payload, Payload::PingResponse));
+        assert!(matches!(resp.payload, Payload::PingResponse { .. }));
 
         handler.await.unwrap();
     }

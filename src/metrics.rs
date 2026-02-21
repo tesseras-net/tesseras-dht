@@ -25,6 +25,7 @@ pub const BOOTSTRAP_TOTAL: &str = "tessera_bootstrap_total";
 pub const REPLICATION_CHUNKS_SENT_TOTAL: &str =
     "tessera_replication_chunks_sent_total";
 pub const REPLICATION_TRIGGER_TOTAL: &str = "tessera_replication_trigger_total";
+pub const CONN_POOL_INBOUND_TOTAL: &str = "tessera_conn_pool_inbound_total";
 
 // --- Gauge names ---
 
@@ -97,6 +98,10 @@ pub fn describe_metrics() {
         REPLICATION_TRIGGER_TOTAL,
         "Proactive replication triggers (reactive or periodic)"
     );
+    describe_counter!(
+        CONN_POOL_INBOUND_TOTAL,
+        "Inbound connections cached in connection pool"
+    );
 
     // Gauges
     describe_gauge!(ROUTING_TABLE_SIZE, "Number of peers in routing table");
@@ -139,13 +144,15 @@ pub fn payload_type_label(p: &Payload) -> &'static str {
         Payload::GetChunkRequest { .. } => "get_chunk",
         Payload::PutChunkRequest { .. } => "put_chunk",
         Payload::RelayRequest { .. } => "relay",
-        Payload::PingResponse => "ping_resp",
+        Payload::PingResponse { .. } => "ping_resp",
         Payload::FindNodeResponse { .. } => "find_node_resp",
         Payload::GetProvidersResponse { .. } => "get_providers_resp",
         Payload::AddProviderResponse { .. } => "add_provider_resp",
         Payload::GetChunkResponse { .. } => "get_chunk_resp",
         Payload::PutChunkResponse { .. } => "put_chunk_resp",
         Payload::RelayResponse { .. } => "relay_resp",
+        Payload::ConnectRequest { .. } => "connect",
+        Payload::ConnectResponse { .. } => "connect_resp",
         Payload::Error { .. } => "error",
     }
 }

@@ -71,10 +71,23 @@ pub enum Payload {
         #[serde(default)]
         relay_hops: u8,
     },
+    /// Request forwarded via relay asking the target to connect back to the requester.
+    /// Used for NAT traversal: when peer C can't reach NATed peer A, C sends a
+    /// ConnectRequest via relay asking A to initiate a connection to C.
+    ConnectRequest {
+        requester_addrs: Vec<SocketAddr>,
+        requester_id: [u8; 32],
+        requester_key: [u8; 32],
+    },
 
     // --- Responses ---
     /// Response to [`PingRequest`](Payload::PingRequest).
-    PingResponse,
+    PingResponse {
+        /// The remote address observed by the responder (for NAT traversal).
+        /// Older nodes that don't send this field will deserialize as `None`.
+        #[serde(default)]
+        observed_addr: Option<SocketAddr>,
+    },
     /// Closest known nodes to the requested target.
     FindNodeResponse { nodes: Vec<NodeInfoSerde> },
     /// Known providers for the key, plus closer nodes for iterative lookup.
@@ -90,6 +103,8 @@ pub enum Payload {
     PutChunkResponse { ok: bool },
     /// Result of a relay attempt. `payload` contains the serialized inner response.
     RelayResponse { ok: bool, payload: Vec<u8> },
+    /// Response to [`ConnectRequest`](Payload::ConnectRequest).
+    ConnectResponse { ok: bool },
 
     // --- Error ---
     /// Generic error response with a numeric code and human-readable message.
@@ -197,6 +212,7 @@ impl Message {
                 | Payload::GetChunkRequest { .. }
                 | Payload::PutChunkRequest { .. }
                 | Payload::RelayRequest { .. }
+                | Payload::ConnectRequest { .. }
         )
     }
 }
@@ -364,7 +380,9 @@ mod tests {
                 nonce: 42,
                 difficulty: 8,
             },
-            Payload::PingResponse,
+            Payload::PingResponse {
+                observed_addr: None,
+            },
         );
         assert_eq!(req.msg_id, resp.msg_id);
     }
@@ -383,7 +401,9 @@ mod tests {
             [1u8; 32],
             [2u8; 32],
             test_pow(),
-            Payload::PingResponse,
+            Payload::PingResponse {
+                observed_addr: None,
+            },
         );
         assert!(!resp.is_request());
     }

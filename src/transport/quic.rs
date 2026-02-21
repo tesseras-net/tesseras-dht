@@ -127,6 +127,9 @@ impl QuicTransport {
             rate_burst,
         )));
 
+        let connection_pool: Arc<Mutex<HashMap<SocketAddr, PoolEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         let mut background_tasks = Vec::new();
 
         // Periodic rate limiter cleanup
@@ -144,6 +147,7 @@ impl QuicTransport {
             }
         }));
 
+        let pool_for_inbound = connection_pool.clone();
         background_tasks.push(tokio::spawn(async move {
             tracing::debug!("QUIC acceptor loop started");
             while let Some(incoming) = ep.accept().await {
@@ -151,6 +155,7 @@ impl QuicTransport {
                 let request_tx = request_tx.clone();
                 let resp_senders = resp_senders.clone();
                 let rate_limiter = rate_limiter.clone();
+                let pool_for_inbound = pool_for_inbound.clone();
                 tokio::spawn(async move {
                     let conn = match incoming.await {
                         Ok(c) => c,
@@ -164,6 +169,30 @@ impl QuicTransport {
                         "QUIC: accepted connection from {}",
                         remote_addr
                     );
+
+                    // Cache inbound connection for reuse (NAT traversal).
+                    // This allows the relay handler to forward messages to
+                    // NATed peers via their existing inbound connection.
+                    {
+                        let mut pool = pool_for_inbound.lock().await;
+                        // LRU eviction if pool is full
+                        if pool.len() >= MAX_POOL_SIZE
+                            && let Some((&oldest_addr, _)) =
+                                pool.iter().min_by_key(|(_, entry)| entry.last_used)
+                        {
+                            pool.remove(&oldest_addr);
+                            counter!(crate::metrics::CONN_POOL_EVICTION_TOTAL).increment(1);
+                        }
+                        pool.insert(
+                            remote_addr,
+                            PoolEntry {
+                                conn: conn.clone(),
+                                last_used: tokio::time::Instant::now(),
+                            },
+                        );
+                        gauge!(crate::metrics::CONN_POOL_SIZE).set(pool.len() as f64);
+                        counter!(crate::metrics::CONN_POOL_INBOUND_TOTAL).increment(1);
+                    }
 
                     loop {
                         let stream = match conn.accept_bi().await {
@@ -294,9 +323,6 @@ impl QuicTransport {
                 });
             }
         }));
-
-        let connection_pool: Arc<Mutex<HashMap<SocketAddr, PoolEntry>>> =
-            Arc::new(Mutex::new(HashMap::new()));
 
         // Periodic connection pool cleanup (remove dead connections)
         let pool_cleanup = connection_pool.clone();
@@ -700,7 +726,9 @@ mod tests {
                     nonce: 0,
                     difficulty: 0,
                 },
-                Payload::PingResponse,
+                Payload::PingResponse {
+                    observed_addr: None,
+                },
             );
             tb.send_response(&from_addr, resp).await.unwrap();
         });
@@ -716,7 +744,7 @@ mod tests {
             Payload::PingRequest,
         );
         let resp = transport_a.send_request(&addr_b, req).await.unwrap();
-        assert!(matches!(resp.payload, Payload::PingResponse));
+        assert!(matches!(resp.payload, Payload::PingResponse { .. }));
 
         handler.await.unwrap();
     }
@@ -752,7 +780,9 @@ mod tests {
                         nonce: 0,
                         difficulty: 0,
                     },
-                    Payload::PingResponse,
+                    Payload::PingResponse {
+                        observed_addr: None,
+                    },
                 );
                 tb.send_response(&from_addr, resp).await.unwrap();
             }
@@ -780,7 +810,7 @@ mod tests {
         // All should succeed
         for h in handles {
             let resp = h.await.unwrap().unwrap();
-            assert!(matches!(resp.payload, Payload::PingResponse));
+            assert!(matches!(resp.payload, Payload::PingResponse { .. }));
         }
 
         // Connection pool should contain exactly 1 connection to B

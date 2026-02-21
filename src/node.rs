@@ -320,6 +320,8 @@ pub struct NodeHandle {
     local_addr: SocketAddr,
     erasure_config: ErasureConfig,
     routing_table: Arc<Mutex<RoutingTable>>,
+    /// Externally observed address learned from PingResponse (NAT traversal).
+    external_addr: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 impl NodeHandle {
@@ -397,6 +399,13 @@ impl NodeHandle {
     pub async fn routing_table_info(&self) -> RoutingTableStats {
         let peer_count = self.routing_table.lock().await.len();
         RoutingTableStats { peer_count }
+    }
+
+    /// Returns the externally observed address learned from PingResponse,
+    /// if available. Useful for NAT traversal — the external address is
+    /// the address other peers see for this node.
+    pub async fn external_addr(&self) -> Option<SocketAddr> {
+        *self.external_addr.lock().await
     }
 
     /// Look up providers for a content key.
@@ -836,6 +845,8 @@ pub async fn spawn_node<T: Transport>(
     let config = Arc::new(config);
 
     let routing_table = Arc::new(Mutex::new(routing_table));
+    let external_addr: Arc<Mutex<Option<SocketAddr>>> =
+        Arc::new(Mutex::new(None));
 
     let actor = NodeActor {
         keypair,
@@ -852,6 +863,7 @@ pub async fn spawn_node<T: Transport>(
         peer_chunk_counts,
         config,
         last_maintenance_time: std::time::Instant::now(),
+        external_addr: external_addr.clone(),
     };
 
     tokio::spawn(actor.run());
@@ -862,6 +874,7 @@ pub async fn spawn_node<T: Transport>(
         local_addr,
         erasure_config,
         routing_table,
+        external_addr,
     }
 }
 
@@ -880,6 +893,8 @@ struct NodeActor<T: Transport> {
     peer_chunk_counts: Arc<std::sync::Mutex<HashMap<[u8; 32], u32>>>,
     config: Arc<NodeConfig>,
     last_maintenance_time: std::time::Instant,
+    /// Externally observed address learned from PingResponse (NAT traversal).
+    external_addr: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 struct HandlerContext<T: Transport> {
@@ -894,6 +909,8 @@ struct HandlerContext<T: Transport> {
     write_limiter: Arc<std::sync::Mutex<RateLimiter>>,
     peer_chunk_counts: Arc<std::sync::Mutex<HashMap<[u8; 32], u32>>>,
     config: Arc<NodeConfig>,
+    /// Externally observed address learned from PingResponse (NAT traversal).
+    external_addr: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 impl<T: Transport> Clone for HandlerContext<T> {
@@ -910,11 +927,20 @@ impl<T: Transport> Clone for HandlerContext<T> {
             write_limiter: self.write_limiter.clone(),
             peer_chunk_counts: self.peer_chunk_counts.clone(),
             config: self.config.clone(),
+            external_addr: self.external_addr.clone(),
         }
     }
 }
 
 impl<T: Transport> HandlerContext<T> {
+    /// Returns the externally observed address if available, otherwise local.
+    async fn best_addr(&self) -> SocketAddr {
+        self.external_addr
+            .lock()
+            .await
+            .unwrap_or_else(|| self.transport.local_addr())
+    }
+
     /// Create a new outgoing message with the node's identity and client_mode flag.
     fn new_message(&self, payload: Payload) -> Message {
         let mut msg = Message::new(
@@ -925,6 +951,79 @@ impl<T: Transport> HandlerContext<T> {
         );
         msg.client_mode = self.config.client_mode;
         msg
+    }
+
+    /// Ask a NATed peer to connect back to us via relay (connection reversal).
+    ///
+    /// Sends a `ConnectRequest` wrapped in a `RelayRequest` to a relay node,
+    /// which forwards it to the target. The target then initiates a connection
+    /// to our addresses, creating a bidirectional path.
+    async fn request_reverse_connection(
+        &self,
+        target_id: &NodeId,
+    ) -> Result<(), TesseraError> {
+        let my_addr = self.best_addr().await;
+        let inner_msg = {
+            let mut msg = self.new_message(Payload::ConnectRequest {
+                requester_addrs: vec![my_addr],
+                requester_id: *self.node_id.as_bytes(),
+                requester_key: self.keypair.public_key_bytes(),
+            });
+            msg.sign(&self.keypair);
+            msg
+        };
+        let inner_bytes = inner_msg.to_bytes().map_err(|e| {
+            TesseraError::Serialization(format!(
+                "failed to serialize ConnectRequest: {}",
+                e
+            ))
+        })?;
+
+        // Try relay candidates (closest nodes to us)
+        let candidates = self
+            .routing_table
+            .lock()
+            .await
+            .closest_nodes(&self.node_id, self.config.k);
+
+        for candidate in &candidates {
+            if candidate.node_id == *target_id
+                || candidate.node_id == self.node_id
+                || candidate.addresses.is_empty()
+            {
+                continue;
+            }
+
+            let mut relay_msg = self.new_message(Payload::RelayRequest {
+                target_id: *target_id.as_bytes(),
+                payload: inner_bytes.clone(),
+                relay_hops: 0,
+            });
+            relay_msg.sign(&self.keypair);
+
+            if let Ok(resp) = send_request_any(
+                &*self.transport,
+                &candidate.addresses,
+                &relay_msg,
+            )
+            .await
+                && let Payload::RelayResponse { ok: true, payload } =
+                    resp.payload
+                && let Ok(inner) = Message::from_bytes(&payload)
+                && matches!(
+                    inner.payload,
+                    Payload::ConnectResponse { ok: true }
+                )
+            {
+                // Give the target time to establish the connection
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                return Ok(());
+            }
+        }
+
+        Err(TesseraError::Network(
+            "connection reversal failed: no relay succeeded".into(),
+        ))
     }
 
     /// Bootstrap by pinging each address, then performing an iterative lookup.
@@ -942,6 +1041,14 @@ impl<T: Transport> HandlerContext<T> {
             msg.sign(&self.keypair);
             match self.transport.send_request(addr, msg).await {
                 Ok(resp) => {
+                    // Extract observed address for NAT traversal
+                    if let Payload::PingResponse {
+                        observed_addr: Some(ext),
+                    } = &resp.payload
+                    {
+                        *self.external_addr.lock().await = Some(*ext);
+                    }
+
                     let peer_id = NodeId::from_bytes(resp.sender_id);
                     let node_info =
                         NodeInfo::new(peer_id, resp.sender_key, vec![*addr]);
@@ -1036,13 +1143,13 @@ impl<T: Transport> HandlerContext<T> {
                     msg.client_mode = client_mode;
                     msg.sign(&kp);
 
-                    // Try direct (all addresses), then relay fallback (S19)
+                    // Try direct, then connection reversal, then relay
                     let result =
                         send_request_any(&*transport, &addrs, &msg).await;
                     let resp = match result {
                         Ok(resp) => resp,
                         Err(_) => {
-                            // Try relay
+                            // Try relay (includes connection reversal for NATed peers)
                             let candidates =
                                 rt.lock().await.closest_nodes(&my_id, k);
                             let msg_bytes = match msg.to_bytes() {
@@ -1143,6 +1250,14 @@ impl<T: Transport> HandlerContext<T> {
 }
 
 impl<T: Transport> NodeActor<T> {
+    /// Returns the externally observed address if available, otherwise local.
+    async fn best_addr(&self) -> SocketAddr {
+        self.external_addr
+            .lock()
+            .await
+            .unwrap_or_else(|| self.transport.local_addr())
+    }
+
     /// Create a new outgoing message with the actor's identity and client_mode flag.
     fn new_message(&self, payload: Payload) -> Message {
         let mut msg = Message::new(
@@ -1168,6 +1283,7 @@ impl<T: Transport> NodeActor<T> {
             write_limiter: self.write_limiter.clone(),
             peer_chunk_counts: self.peer_chunk_counts.clone(),
             config: self.config.clone(),
+            external_addr: self.external_addr.clone(),
         }
     }
 
@@ -1423,7 +1539,7 @@ impl<T: Transport> NodeActor<T> {
         tracing::info!("republishing {} provider records", own_keys.len());
 
         // 3. Re-announce each key to closest nodes
-        let local_addr = self.transport.local_addr();
+        let local_addr = self.best_addr().await;
         for key in &own_keys {
             // Refresh our own provider record TTL
             let metadata = self.metadata.clone();
@@ -1628,18 +1744,53 @@ impl<T: Transport> NodeActor<T> {
         Err(TesseraError::Network("all relay candidates failed".into()))
     }
 
-    /// Try direct send to each address first, fall back to relay on failure (S19).
+    /// Ask a NATed peer to connect back to us via relay (connection reversal).
+    async fn request_reverse_connection(
+        &self,
+        target_id: &NodeId,
+    ) -> Result<(), TesseraError> {
+        self.handler_context()
+            .request_reverse_connection(target_id)
+            .await
+    }
+
+    /// Unified NAT traversal: direct → connection reversal → relay.
+    ///
+    /// 1. Try direct send to all known addresses
+    /// 2. If direct fails, attempt connection reversal (ask target to connect back)
+    /// 3. If reversal succeeds, retry direct send (should hit cached inbound connection)
+    /// 4. If all else fails, fall back to full message relay
     #[instrument(skip(self, msg), fields(target = %hex::encode(&target_id.as_bytes()[..4])))]
-    async fn send_or_relay(
+    async fn send_with_nat_traversal(
         &self,
         addrs: &[SocketAddr],
         target_id: &NodeId,
         msg: Message,
     ) -> Result<Message, TesseraError> {
+        // 1. Try direct
         match send_request_any(&*self.transport, addrs, &msg).await {
-            Ok(resp) => Ok(resp),
-            Err(_) => self.send_via_relay(target_id, msg).await,
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                tracing::debug!(
+                    "direct send to {} failed: {}, trying NAT traversal",
+                    hex::encode(&target_id.as_bytes()[..4]),
+                    e
+                );
+            }
         }
+
+        // 2. Try connection reversal: ask target to connect back to us
+        if self.request_reverse_connection(target_id).await.is_ok() {
+            // 3. Retry direct — should find cached inbound connection from Step 1
+            if let Ok(resp) =
+                send_request_any(&*self.transport, addrs, &msg).await
+            {
+                return Ok(resp);
+            }
+        }
+
+        // 4. Fall back to full relay
+        self.send_via_relay(target_id, msg).await
     }
 
     // --- Bootstrap ---
@@ -1719,7 +1870,7 @@ impl<T: Transport> NodeActor<T> {
                 let mut msg =
                     self.new_message(Payload::GetProvidersRequest { key });
                 msg.sign(&self.keypair);
-                match self.send_or_relay(addrs, peer_id, msg).await {
+                match self.send_with_nat_traversal(addrs, peer_id, msg).await {
                     Ok(resp) => {
                         if let Payload::GetProvidersResponse {
                             providers,
@@ -1786,6 +1937,7 @@ impl<T: Transport> NodeActor<T> {
         config: ErasureConfig,
     ) -> Result<StoreTesseraResult, TesseraError> {
         let start = std::time::Instant::now();
+        let announce_addr = self.best_addr().await;
         let encoded = erasure::encode(&data, &config)?;
 
         // Store chunks locally first
@@ -1840,7 +1992,7 @@ impl<T: Transport> NodeActor<T> {
             let metadata = self.metadata.clone();
             let node_id = *self.node_id.as_bytes();
             let public_key = self.keypair.public_key_bytes();
-            let local_addr = self.transport.local_addr();
+            let local_addr = announce_addr;
             let provider_ttl = self.config.provider_ttl;
             let _ = tokio::task::spawn_blocking(move || {
                 metadata
@@ -1873,7 +2025,7 @@ impl<T: Transport> NodeActor<T> {
                 }
                 let mut msg = self.new_message(Payload::AddProviderRequest {
                     key: *hash,
-                    addresses: vec![self.transport.local_addr()],
+                    addresses: vec![announce_addr],
                 });
                 msg.sign(&self.keypair);
                 let transport = self.transport.clone();
@@ -2212,7 +2364,9 @@ async fn handle_inbound_message<T: Transport>(
     let handler_start = std::time::Instant::now();
 
     let response_payload = match msg.payload {
-        Payload::PingRequest => Payload::PingResponse,
+        Payload::PingRequest => Payload::PingResponse {
+            observed_addr: Some(from_addr),
+        },
         Payload::FindNodeRequest { target } => {
             let target_id = NodeId::from_bytes(target);
             let closest = ctx
@@ -2471,6 +2625,35 @@ async fn handle_inbound_message<T: Transport>(
                     },
                 }
             }
+        }
+        Payload::ConnectRequest {
+            ref requester_addrs,
+            requester_id: _,
+            requester_key: _,
+        } => {
+            // NAT traversal: the requester can't reach us directly, so they
+            // ask us (via relay) to connect back to them. We attempt a ping
+            // to the requester's addresses — this creates an outbound QUIC
+            // connection that gets cached in our pool AND (via Step 1) in
+            // the requester's pool when they accept it.
+            let mut ok = false;
+            for addr in requester_addrs {
+                let mut ping = ctx.new_message(Payload::PingRequest);
+                ping.sign(&ctx.keypair);
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ctx.transport.send_request(addr, ping),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        ok = true;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            Payload::ConnectResponse { ok }
         }
         _ => {
             // Ignore responses that arrive as requests
@@ -3100,7 +3283,7 @@ mod tests {
             .send_request(&node_a.local_addr(), msg)
             .await
             .unwrap();
-        assert!(matches!(resp.payload, Payload::PingResponse));
+        assert!(matches!(resp.payload, Payload::PingResponse { .. }));
 
         node_a.shutdown().await;
     }
